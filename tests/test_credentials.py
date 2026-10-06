@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 
+import httpx
 import pytest
 from starlette.requests import Request
 from starlette.testclient import TestClient
@@ -10,7 +12,7 @@ from starlette.testclient import TestClient
 from tests.conftest import FakeZammad
 from tests.helpers import rpc, tool_text
 from zammad_mcp.client import ZammadClient
-from zammad_mcp.client.errors import MissingTokenError
+from zammad_mcp.client.errors import MissingTokenError, UnexpectedResponseError
 from zammad_mcp.credentials import header as header_module
 from zammad_mcp.credentials.base import Profile, ProfileMemo, ZammadCredential, fetch_profile, token_identity
 from zammad_mcp.credentials.header import HeaderCredentialProvider, api_key_mount, on_api_key_mount, request_token
@@ -106,6 +108,71 @@ async def test_profile_memo_expires_and_evicts():
     assert loads == [Tier.AGENT, Tier.CUSTOMER, Tier.CUSTOMER, Tier.AGENT]
 
 
+async def test_memo_is_capped_oldest_first():
+    memo = ProfileMemo(ttl_seconds=60, max_entries=100)
+
+    async def load():
+        return Profile(tier=Tier.CUSTOMER)
+
+    for index in range(5000):
+        await memo.get(f"id{index}", load)
+    assert memo.size == 100
+    assert memo.lock_count <= 100
+    assert next(iter(memo._entries)) == "id4900"
+
+
+async def test_memo_never_drops_a_held_lock():
+    memo = ProfileMemo(ttl_seconds=60, max_entries=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow():
+        started.set()
+        await release.wait()
+        return Profile(tier=Tier.AGENT)
+
+    async def fast():
+        return Profile(tier=Tier.CUSTOMER)
+
+    slow_lookup = asyncio.create_task(memo.get("slow", slow))
+    await started.wait()
+    held = memo._locks["slow"]
+    await memo.get("other", fast)
+    await memo.get("another", fast)
+    assert memo._locks.get("slow") is held
+    release.set()
+    assert (await slow_lookup).tier is Tier.AGENT
+
+
+async def test_a_crashed_lookup_frees_its_lock():
+    memo = ProfileMemo(ttl_seconds=60)
+
+    async def broken():
+        raise RuntimeError("bug")
+
+    with pytest.raises(RuntimeError):
+        await memo.get("x", broken)
+    assert (memo.size, memo.lock_count) == (0, 0)
+
+
+async def test_a_zammad_failure_is_remembered_as_unknown():
+    memo = ProfileMemo(ttl_seconds=60)
+
+    async def broken():
+        raise UnexpectedResponseError("odd")
+
+    assert (await memo.get("x", broken)).tier is None
+    assert memo.size == 1
+
+
+@pytest.mark.parametrize("body", [None, "text", {"id": "not-a-number"}])
+async def test_fetch_profile_turns_odd_shapes_into_zammad_errors(body):
+    fake = FakeZammad()
+    fake.routes[("GET", "/api/v1/users/me")] = httpx.Response(200, content=json.dumps(body).encode())
+    with pytest.raises(UnexpectedResponseError):
+        await fetch_profile(client_for(fake), "t")
+
+
 async def capture_scope(headers: list[tuple[bytes, bytes]]) -> dict:
     captured = {}
 
@@ -122,6 +189,7 @@ async def test_api_key_mount_strips_identity_headers_and_marks_the_scope():
             (b"x-zammad-token", b"user-token"),
             (b"x-auth-request-email", b"victim@example.com"),
             (b"X-Auth-Request-User", b"v"),
+            (b"x_auth_request_email", b"victim@example.com"),
         ]
     )
     assert scope["headers"] == [(b"x-zammad-token", b"user-token")]
@@ -153,23 +221,41 @@ def call_get_me(client: TestClient, path: str, headers: dict[str, str]) -> str:
     return tool_text(rpc(client, path, "tools/call", {"name": "get_me", "arguments": {}}, headers))
 
 
-def test_api_key_mount_uses_the_callers_token_end_to_end(settings, fake):
-    headers = {"X-Zammad-Token": "user-token", "X-Auth-Request-Email": "victim@example.com"}
-    with TestClient(build_http_app(build_server(settings, transport=fake))) as client:
+def serve(settings, fake) -> TestClient:
+    return TestClient(build_http_app(build_server(settings, transport=fake), settings))
+
+
+@pytest.mark.parametrize("smuggled", ["X-Auth-Request-Email", "X_Auth_Request_Email", "x-auth-request_email"])
+def test_api_key_mount_uses_the_callers_token_end_to_end(api_key_settings, fake, smuggled):
+    headers = {"X-Zammad-Token": "user-token", smuggled: "victim@example.com"}
+    with serve(api_key_settings, fake) as client:
         shaped = json.loads(call_get_me(client, "/http/api-key/mcp", headers))
-    assert shaped["login"] == "agent@example.com"
-    me_calls = fake.calls("GET", "/users/me")
-    assert me_calls[-1].headers["authorization"] == "Token token=user-token"
+    assert "agent@example.com" in shaped["login"]
+    assert {r.headers["authorization"] for r in fake.requests} == {"Token token=user-token"}
     assert all("x-auth-request" not in name.lower() for r in fake.requests for name in r.headers)
 
 
-def test_plain_mount_ignores_the_header_and_uses_the_static_token(settings, fake):
-    with TestClient(build_http_app(build_server(settings, transport=fake))) as client:
+def test_plain_mount_ignores_the_header_and_uses_the_static_token(shared_settings, fake):
+    with serve(shared_settings, fake) as client:
         call_get_me(client, "/mcp", {"X-Zammad-Token": "user-token"})
     assert {r.headers["authorization"] for r in fake.requests} == {"Token token=secret-token"}
 
 
-def test_api_key_mount_without_header_returns_an_error(settings, fake):
-    with TestClient(build_http_app(build_server(settings, transport=fake))) as client:
+def test_api_key_mount_without_header_returns_an_error(api_key_settings, fake):
+    with serve(api_key_settings, fake) as client:
         text = call_get_me(client, "/http/api-key/mcp", {})
     assert text == "Error: send your personal Zammad API token in the X-Zammad-Token header"
+
+
+def test_api_key_mount_rejects_a_non_ascii_token(api_key_settings, fake):
+    with serve(api_key_settings, fake) as client:
+        text = call_get_me(client, "/http/api-key/mcp", {"X-Zammad-Token": "t\xe9st".encode()})
+    assert text == "Error: the X-Zammad-Token header must be printable ASCII without spaces"
+    assert fake.requests == []
+
+
+def test_without_the_opt_in_mcp_is_not_served(api_key_settings, fake):
+    with serve(api_key_settings, fake) as client:
+        response = client.post("/mcp", json={}, headers={"Accept": "application/json, text/event-stream"})
+    assert response.status_code == 404
+    assert fake.requests == []

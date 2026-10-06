@@ -90,6 +90,34 @@ def test_gate_defaults():
     assert settings.enabled_modules == frozenset(TOOL_MODULES)
 
 
+@pytest.mark.parametrize("name", ["ZAMMAD_TIMEOUT_SECONDS", "ZAMMAD_CONNECT_TIMEOUT_SECONDS"])
+@pytest.mark.parametrize("value", ["inf", "nan", "-inf", "1e999"])
+def test_timeouts_must_be_finite(name, value):
+    with pytest.raises(ConfigError, match="finite"):
+        Settings.from_env({"ZAMMAD_URL": "https://z.test", name: value})
+
+
+@pytest.mark.parametrize("value", ["0", "1.5", "abc", "-3", "\u00b2", "inf"])
+def test_confirm_ttl_must_be_a_positive_whole_number(value):
+    with pytest.raises(ConfigError, match="ZAMMAD_CONFIRM_TTL_SECONDS"):
+        Settings.from_env({"ZAMMAD_URL": "https://z.test", "ZAMMAD_CONFIRM_TTL_SECONDS": value})
+
+
+def test_port_rejects_non_ascii_digits():
+    with pytest.raises(ConfigError, match="MCP_HTTP_PORT"):
+        Settings.from_env({"ZAMMAD_URL": "https://z.test", "MCP_HTTP_PORT": "\u0668\u0660"})
+
+
+def test_shared_token_route_flag():
+    settings = Settings.from_env(
+        {"ZAMMAD_URL": "https://z.test", "ZAMMAD_HTTP_TOKEN": "t", "ZAMMAD_HTTP_SHARED_TOKEN_ROUTE": "true"}
+    )
+    settings.check_http()
+    with pytest.raises(ConfigError, match="ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true to accept"):
+        Settings.from_env({"ZAMMAD_URL": "https://z.test", "ZAMMAD_HTTP_TOKEN": "t"}).check_http()
+    Settings.from_env({"ZAMMAD_URL": "https://z.test"}).check_http()
+
+
 def test_module_flag_names():
     assert module_flag("tickets") == "ZAMMAD_ENABLE_TICKETS"
 

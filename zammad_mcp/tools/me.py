@@ -13,16 +13,21 @@ from zammad_mcp.tiers import Tier
 from zammad_mcp.tools.context import READ, ToolContext
 
 
+def describe_tier(tier: Tier | None) -> str:
+    return "unknown" if tier is None else tier.name.lower()
+
+
 def register(mcp: FastMCP, context: ToolContext) -> None:
-    @mcp.tool(**context.tool("Get current Zammad user", READ, module="me", tier=Tier.CUSTOMER))
+    @mcp.tool(**context.tool("Get current Zammad user", READ, module="me", tier=Tier.NONE))
     async def get_me() -> dict[str, Any] | str:
-        """Return the Zammad user the current token belongs to: id, login, name, email, roles and tier."""
+        """Return the Zammad user the current token belongs to: id, login, name, email, roles and tier.
+
+        ``tier`` is ``agent``, ``customer``, ``none`` (no ticket permissions,
+        e.g. an Admin-only account) or ``unknown`` (the role lookup failed).
+        """
         try:
             session = await context.session()
-            user = User.model_validate(await session.get("/users/me", {"expand": "true"}))
+            user = User.parse(await session.get("/users/me", {"expand": "true"}))
         except ZammadError as error:
             return to_tool_error(error)
-        shaped = shape_user(user, context.links)
-        if session.tier is not None:
-            shaped["tier"] = session.tier.name.lower()
-        return shaped
+        return {**shape_user(user, context.links), "tier": describe_tier(session.tier)}

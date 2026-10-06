@@ -12,7 +12,7 @@ from zammad_mcp.client.models import Article
 from zammad_mcp.client.pagination import PageRequest, paginate_locally
 from zammad_mcp.shaping import MAX_BODY_CHARS, UNTRUSTED_NOTICE, shape_article
 from zammad_mcp.tiers import Tier
-from zammad_mcp.tools.context import CREATE, READ, ToolContext
+from zammad_mcp.tools.context import CREATE, READ, ToolContext, as_list
 
 MODULE = "articles"
 EXPAND = {"expand": "true"}
@@ -37,11 +37,11 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         """
         try:
             session = await context.session()
-            rows = await session.get(f"/ticket_articles/by_ticket/{ticket_id}", EXPAND) or []
+            rows = as_list(await session.get(f"/ticket_articles/by_ticket/{ticket_id}", EXPAND))
+            result = paginate_locally(list(reversed(rows)), PageRequest.of(page, per_page))
+            shaped = result.map(lambda row: shape_article(Article.parse(row), links, max_chars=max_chars))
         except ZammadError as error:
             return to_tool_error(error)
-        result = paginate_locally(list(reversed(rows)), PageRequest.of(page, per_page))
-        shaped = result.map(lambda row: shape_article(Article.model_validate(row), links, max_chars=max_chars))
         return {**shaped.to_dict("articles"), "notice": UNTRUSTED_NOTICE}
 
     @mcp.tool(**context.tool("Get ticket article", READ, module=MODULE, tier=Tier.CUSTOMER))
@@ -54,10 +54,10 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         """Get one article with its plain-text body and attachment list. Raise max_chars to read a long body."""
         try:
             session = await context.session()
-            row = await session.get(f"/ticket_articles/{article_id}", EXPAND)
+            article = Article.parse(await session.get(f"/ticket_articles/{article_id}", EXPAND))
         except ZammadError as error:
             return to_tool_error(error)
-        return {**shape_article(Article.model_validate(row), links, max_chars=max_chars), "notice": UNTRUSTED_NOTICE}
+        return {**shape_article(article, links, max_chars=max_chars), "notice": UNTRUSTED_NOTICE}
 
     if not context.writes_enabled:
         return
@@ -91,7 +91,6 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
             }
             if subject:
                 payload["subject"] = subject
-            created = await session.post("/ticket_articles", payload, EXPAND)
+            return shape_article(Article.parse(await session.post("/ticket_articles", payload, EXPAND)), links)
         except ZammadError as error:
             return to_tool_error(error)
-        return shape_article(Article.model_validate(created), links)

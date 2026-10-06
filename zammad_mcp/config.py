@@ -6,6 +6,7 @@ dict instead of patching ``os.environ``.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ class Settings:
     filter_tools_by_role: bool = False
     confirm_ttl_seconds: int = DEFAULT_CONFIRM_TTL_SECONDS
     enabled_modules: frozenset[str] = field(default_factory=lambda: frozenset(TOOL_MODULES))
+    http_shared_token_route: bool = False
 
     @property
     def api_base_url(self) -> str:
@@ -46,6 +48,17 @@ class Settings:
 
     def module_enabled(self, module: str) -> bool:
         return module in self.enabled_modules
+
+    def check_http(self) -> None:
+        """Refuse an HTTP setup that would hand ``ZAMMAD_HTTP_TOKEN`` to anyone who can reach ``/mcp``."""
+        if self.http_token and not self.http_shared_token_route:
+            raise ConfigError(
+                "ZAMMAD_HTTP_TOKEN is set in http mode: /mcp would act as that token's owner for anyone who can "
+                "reach it. Unset it and have each user send X-Zammad-Token to /http/api-key/mcp, or set "
+                "ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true to accept that"
+            )
+        if self.http_shared_token_route and not self.http_token:
+            raise ConfigError("ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true needs ZAMMAD_HTTP_TOKEN")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -64,10 +77,11 @@ class Settings:
             public_url=_read(env, "ZAMMAD_PUBLIC_URL").rstrip("/"),
             read_only=env_flag("ZAMMAD_READ_ONLY", environ=env),
             filter_tools_by_role=env_flag("ZAMMAD_FILTER_TOOLS_BY_ROLE", environ=env),
-            confirm_ttl_seconds=int(_positive_float(env, "ZAMMAD_CONFIRM_TTL_SECONDS", DEFAULT_CONFIRM_TTL_SECONDS)),
+            confirm_ttl_seconds=_positive_int(env, "ZAMMAD_CONFIRM_TTL_SECONDS", DEFAULT_CONFIRM_TTL_SECONDS),
             enabled_modules=frozenset(
                 module for module in TOOL_MODULES if env_flag(module_flag(module), default=True, environ=env)
             ),
+            http_shared_token_route=env_flag("ZAMMAD_HTTP_SHARED_TOKEN_ROUTE", environ=env),
         )
 
 
@@ -87,15 +101,24 @@ def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name}={raw!r} is not a number") from exc
-    if value <= 0:
-        raise ConfigError(f"{name} must be greater than zero")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{name} must be a finite number greater than zero")
     return value
+
+
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = _read(env, name)
+    if not raw:
+        return default
+    if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
+        raise ConfigError(f"{name}={raw!r} must be a whole number of at least 1")
+    return int(raw)
 
 
 def _port(env: Mapping[str, str], name: str, default: int) -> int:
     raw = _read(env, name)
     if not raw:
         return default
-    if not raw.isdigit() or not 1 <= int(raw) <= 65535:
+    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= 65535:
         raise ConfigError(f"{name}={raw!r} is not a valid TCP port")
     return int(raw)

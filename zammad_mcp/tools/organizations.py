@@ -26,7 +26,7 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         """Get one organization. Customers can only read their own."""
         try:
             session = await context.session()
-            organization = Organization.model_validate(await session.get(f"/organizations/{organization_id}", EXPAND))
+            organization = Organization.parse(await session.get(f"/organizations/{organization_id}", EXPAND))
         except ZammadError as error:
             return to_tool_error(error)
         return shape_organization(organization, links)
@@ -43,11 +43,8 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             if session.lacks(Tier.AGENT):
-                return tier_error(Tier.AGENT)
-            found = await session.get("/organizations/search", params)
+                return tier_error(Tier.AGENT, session.tier)
+            found = page_from_response(await session.get("/organizations/search", params), paging)
+            return found.map(lambda row: shape_organization(Organization.parse(row), links)).to_dict("organizations")
         except ZammadError as error:
             return to_tool_error(error)
-        page_of_orgs = page_from_response(found, paging)
-        return page_of_orgs.map(lambda row: shape_organization(Organization.model_validate(row), links)).to_dict(
-            "organizations"
-        )

@@ -8,9 +8,9 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from zammad_mcp.client import ZammadError, to_tool_error
-from zammad_mcp.shaping import UNTRUSTED_NOTICE, Links, frame_untrusted
+from zammad_mcp.shaping import UNTRUSTED_NOTICE, Links, untrusted_field
 from zammad_mcp.tiers import Tier
-from zammad_mcp.tools.context import READ, ToolContext
+from zammad_mcp.tools.context import READ, ToolContext, as_dict, as_list
 
 MODULE = "search"
 SearchObject = Literal["Ticket", "User", "Organization"]
@@ -28,29 +28,34 @@ def shape_hit(kind: str, item_id: int, asset: dict[str, Any], links: Links) -> d
             "type": kind,
             "id": item_id,
             "number": asset.get("number"),
-            "title": frame_untrusted(asset.get("title"), source="ticket_title", item_id=item_id),
+            "title": untrusted_field(asset.get("title"), source="ticket_title", item_id=item_id),
             "url": links.ticket(item_id),
         }
     if kind == "User":
         return {
             "type": kind,
             "id": item_id,
-            "name": _full_name(asset),
-            "email": asset.get("email"),
+            "name": untrusted_field(_full_name(asset), source="user_name", item_id=item_id),
+            "email": untrusted_field(asset.get("email"), source="user_email", item_id=item_id),
             "url": links.user(item_id),
         }
     if kind == "Organization":
-        return {"type": kind, "id": item_id, "name": asset.get("name"), "url": links.organization(item_id)}
+        name = untrusted_field(asset.get("name"), source="organization_name", item_id=item_id)
+        return {"type": kind, "id": item_id, "name": name, "url": links.organization(item_id)}
     return {"type": kind, "id": item_id}
 
 
 def shape_results(body: dict[str, Any], links: Links) -> list[dict[str, Any]]:
-    assets = body.get("assets") or {}
+    assets = as_dict(body.get("assets"))
     return [
-        shape_hit(hit["type"], hit["id"], (assets.get(hit["type"]) or {}).get(str(hit["id"])) or {}, links)
-        for hit in body.get("result") or []
-        if "type" in hit and "id" in hit
+        shape_hit(hit["type"], hit["id"], as_dict(as_dict(assets.get(hit["type"])).get(str(hit["id"]))), links)
+        for hit in as_list(body.get("result"))
+        if _is_hit(hit)
     ]
+
+
+def _is_hit(hit: Any) -> bool:
+    return isinstance(hit, dict) and isinstance(hit.get("type"), str) and isinstance(hit.get("id"), int)
 
 
 def register(mcp: FastMCP, context: ToolContext) -> None:
@@ -68,7 +73,7 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         params = {"query": query.strip(), "limit": limit, "objects": "-".join(objects or DEFAULT_OBJECTS)}
         try:
             session = await context.session()
-            body = await session.get("/search", params) or {}
+            body = as_dict(await session.get("/search", params))
         except ZammadError as error:
             return to_tool_error(error)
         return {"results": shape_results(body, context.links), "notice": UNTRUSTED_NOTICE}

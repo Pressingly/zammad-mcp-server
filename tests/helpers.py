@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from starlette.testclient import TestClient
@@ -24,3 +25,18 @@ def tool_names(result: dict[str, Any]) -> set[str]:
 
 def tool_text(result: dict[str, Any]) -> str:
     return result["content"][0]["text"]
+
+
+_FRAME = re.compile(r'^<untrusted_content source="[a-z_]+" id="[^"]*">\n?(.*?)\n?</untrusted_content>$', re.DOTALL)
+
+
+def unframed(value: Any) -> Any:
+    """Strip ``<untrusted_content>`` frames recursively, for comparing shaped output with plain values."""
+    if isinstance(value, dict):
+        return {key: unframed(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [unframed(item) for item in value]
+    if isinstance(value, str):
+        match = _FRAME.match(value)
+        return match.group(1) if match else value
+    return value

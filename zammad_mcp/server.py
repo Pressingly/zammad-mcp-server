@@ -1,15 +1,17 @@
 """Server factories: the FastMCP instance and the HTTP app around it.
 
-The HTTP app serves the same MCP endpoint twice:
+The HTTP app serves the MCP endpoint on:
 
-- ``/mcp`` with the operator's ``ZAMMAD_HTTP_TOKEN`` (community mode), and
 - ``/http/api-key/mcp``, where every caller sends their own token as
-  ``X-Zammad-Token`` and ``X-Auth-Request-*`` headers are stripped.
+  ``X-Zammad-Token`` and ``X-Auth-Request-*`` headers are stripped, and
+- ``/mcp`` with the operator's ``ZAMMAD_HTTP_TOKEN``, only when
+  ``ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true``: anyone who reaches it acts as the
+  token's owner.
 """
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -20,7 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from zammad_mcp.client import ZammadClient, ZammadError
+from zammad_mcp.client import ZammadClient
 from zammad_mcp.config import Settings
 from zammad_mcp.confirmations import Confirmations, MemoryConfirmationBackend
 from zammad_mcp.credentials import (
@@ -33,6 +35,8 @@ from zammad_mcp.credentials.header import API_KEY_MOUNT_PATH
 from zammad_mcp.shaping import Links
 from zammad_mcp.tiers import TierResolver, community_tier_resolver, require_tier
 from zammad_mcp.tools import ToolContext, register_tools
+
+logger = logging.getLogger(__name__)
 
 SERVER_NAME = "zammad"
 MCP_PATH = "/mcp"
@@ -61,8 +65,7 @@ def build_server(
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
-        with contextlib.suppress(ZammadError):
-            await static.warm()
+        await _warm(static)
         try:
             yield
         finally:
@@ -81,17 +84,29 @@ def build_server(
     return mcp
 
 
+async def _warm(static: StaticCredentialProvider) -> None:
+    """Best effort: a Zammad that is down or answers oddly must never stop the server starting."""
+    try:
+        await static.warm()
+    except Exception:
+        logger.warning("could not read the static token's Zammad role at startup", exc_info=True)
+
+
 async def healthz(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-def build_http_app(mcp: FastMCP) -> Starlette:
+def build_http_app(mcp: FastMCP, settings: Settings) -> Starlette:
+    """Serve ``/http/api-key/mcp`` always, and ``/mcp`` only on the shared-token opt-in.
+
+    Raises :class:`ConfigError` for a setup :meth:`Settings.check_http` refuses.
+    """
+    settings.check_http()
     mcp_app = mcp.http_app(path=MCP_PATH, stateless_http=True)
-    return Starlette(
-        routes=[
-            Route("/healthz", healthz, methods=["GET"]),
-            Mount(API_KEY_MOUNT_PATH, app=api_key_mount(mcp_app)),
-            Mount("/", app=mcp_app),
-        ],
-        lifespan=mcp_app.lifespan,
-    )
+    routes = [
+        Route("/healthz", healthz, methods=["GET"]),
+        Mount(API_KEY_MOUNT_PATH, app=api_key_mount(mcp_app)),
+    ]
+    if settings.http_shared_token_route:
+        routes.append(Mount("/", app=mcp_app))
+    return Starlette(routes=routes, lifespan=mcp_app.lifespan)

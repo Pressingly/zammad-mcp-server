@@ -21,26 +21,35 @@ permission on every call.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Iterable
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
 from fastmcp.server.auth import AuthCheck, AuthContext
 
-from zammad_mcp.client.errors import ZammadError
-
 if TYPE_CHECKING:
     from fastmcp.server.auth import AccessToken
 
     from zammad_mcp.credentials.base import CredentialProvider
 
+logger = logging.getLogger(__name__)
+
 TIER_TAG_PREFIX = "tier:"
 AGENT_PERMISSION = "ticket.agent"
+CUSTOMER_PERMISSION = "ticket.customer"
 
 
 class Tier(IntEnum):
+    """``NONE`` is a user with no ``ticket.*`` permission at all, such as an Admin-only account."""
+
+    NONE = 0
     CUSTOMER = 1
     AGENT = 2
+
+    @property
+    def label(self) -> str:
+        return {Tier.NONE: "an account without ticket permissions", Tier.CUSTOMER: "a customer"}.get(self, "an agent")
 
     @property
     def tag(self) -> str:
@@ -56,7 +65,12 @@ def has_permission(permissions: Iterable[str], wanted: str) -> bool:
 
 
 def tier_for(permissions: Iterable[str]) -> Tier:
-    return Tier.AGENT if has_permission(permissions, AGENT_PERMISSION) else Tier.CUSTOMER
+    held = frozenset(permissions)
+    if has_permission(held, AGENT_PERMISSION):
+        return Tier.AGENT
+    if has_permission(held, CUSTOMER_PERMISSION):
+        return Tier.CUSTOMER
+    return Tier.NONE
 
 
 _TIERS_BY_TAG = {tier.tag: tier for tier in Tier}
@@ -73,14 +87,21 @@ def tier_allows(caller: Tier | None, needed: Tier | None) -> bool:
 def require_tier(resolver: TierResolver) -> AuthCheck:
     """Build the ``auth=`` check shared by every tool.
 
-    An unknown caller tier (``None``) means "do not filter".
+    An unknown caller tier (``None``) means "do not filter", and so does a
+    resolver that fails: FastMCP would read an exception as a denial and blank
+    the tool list.
     """
 
     async def check(ctx: AuthContext) -> bool:
         needed = required_tier(ctx.component.tags)
         if needed is None:
             return True
-        return tier_allows(await resolver(ctx.token), needed)
+        try:
+            caller = await resolver(ctx.token)
+        except Exception:
+            logger.warning("tier resolver failed; showing the tool unfiltered", exc_info=True)
+            caller = None
+        return tier_allows(caller, needed)
 
     return check
 
@@ -93,7 +114,8 @@ def credential_tier_resolver(credentials: CredentialProvider) -> TierResolver:
     async def resolve(_token: AccessToken | None) -> Tier | None:
         try:
             return (await credentials.resolve()).tier
-        except ZammadError:
+        except Exception:
+            logger.warning("could not resolve the caller's tier; showing every tool", exc_info=True)
             return None
 
     return resolve

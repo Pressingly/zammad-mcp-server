@@ -16,7 +16,7 @@ class StaticCredentialProvider:
     def __init__(self, client: ZammadClient, token: str | None, *, memo: ProfileMemo | None = None) -> None:
         self._client = client
         self._token = token
-        self._memo = memo or ProfileMemo(ttl_seconds=None)
+        self._memo = memo if memo is not None else ProfileMemo(ttl_seconds=None)
 
     async def resolve(self) -> ZammadCredential:
         if not self._token:

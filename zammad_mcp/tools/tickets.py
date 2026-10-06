@@ -10,9 +10,20 @@ from pydantic import Field
 from zammad_mcp.client import ZammadError, to_tool_error
 from zammad_mcp.client.models import Article, Ticket
 from zammad_mcp.client.pagination import PageRequest, page_from_response, paginate_locally
-from zammad_mcp.shaping import UNTRUSTED_NOTICE, frame_untrusted, shape_article, shape_ticket
+from zammad_mcp.client.text import is_ascii_digits
+from zammad_mcp.shaping import UNTRUSTED_NOTICE, shape_article, shape_ticket, untrusted_field
 from zammad_mcp.tiers import Tier
-from zammad_mcp.tools.context import CREATE, OVERWRITE, READ, ToolContext, ZammadSession, tier_error
+from zammad_mcp.tools.context import (
+    CREATE,
+    OVERWRITE,
+    READ,
+    ToolContext,
+    ZammadSession,
+    agent_only_refusal,
+    as_dict,
+    as_list,
+    tier_error,
+)
 
 MODULE = "tickets"
 EXPAND = {"expand": "true"}
@@ -25,7 +36,6 @@ _FILTER_FIELDS = {
     "owner_id": "ticket.owner_id",
     "organization_id": "ticket.organization_id",
 }
-_FRAMED_HISTORY_ATTRIBUTES = frozenset({"title", "subject", "body", "note"})
 
 PageNumber = Annotated[int, Field(ge=1, description="1-based page number")]
 PerPage = Annotated[int, Field(ge=1, le=100, description="Results per page, at most 100")]
@@ -56,7 +66,7 @@ async def find_ticket_id(session: ZammadSession, reference: str) -> int:
     would be a substring match and find ``#200012`` too.
     """
     text = reference.strip()
-    if text.isdigit():
+    if is_ascii_digits(text):
         return int(text)
     number = text.removeprefix("#").strip()
     if not text.startswith("#") or not number:
@@ -65,12 +75,12 @@ async def find_ticket_id(session: ZammadSession, reference: str) -> int:
     found = page_from_response(await session.search("/tickets/search", EXPAND, body), PageRequest.of(1, 1)).items
     if not found:
         raise TicketReferenceError(f"no ticket #{number} is visible to this user")
-    return Ticket.model_validate(found[0]).id
+    return Ticket.parse(found[0]).id
 
 
 def _customer_reference(customer: str) -> int | str:
     text = customer.strip()
-    if text.isdigit():
+    if is_ascii_digits(text):
         return int(text)
     if "@" in text:
         return f"guess:{text}"
@@ -78,12 +88,12 @@ def _customer_reference(customer: str) -> int | str:
 
 
 def _history_value(entry: dict[str, Any], key: str) -> str | None:
-    value = entry.get(key)
-    if value in (None, ""):
-        return None
-    if (entry.get("attribute") or entry.get("history_attribute")) in _FRAMED_HISTORY_ATTRIBUTES:
-        return frame_untrusted(str(value), source=f"history_{key}", item_id=entry.get("id", ""))
-    return str(value)
+    return untrusted_field(entry.get(key), source=f"history_{key}", item_id=_history_id(entry))
+
+
+def _history_id(entry: dict[str, Any]) -> int | str:
+    entry_id = entry.get("id")
+    return entry_id if isinstance(entry_id, int) else ""
 
 
 def _user_name(assets: dict[str, Any], user_id: Any) -> str | None:
@@ -95,7 +105,9 @@ def _user_name(assets: dict[str, Any], user_id: Any) -> str | None:
 def shape_history(entry: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
     shaped = {
         "created_at": entry.get("created_at"),
-        "created_by": _user_name(assets, entry.get("created_by_id")),
+        "created_by": untrusted_field(
+            _user_name(assets, entry.get("created_by_id")), source="history_created_by", item_id=_history_id(entry)
+        ),
         "type": entry.get("type") or entry.get("history_type"),
         "object": entry.get("object") or entry.get("history_object"),
         "attribute": entry.get("attribute") or entry.get("history_attribute"),
@@ -152,9 +164,9 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             found = await session.search("/tickets/search", {**EXPAND, "with_total_count": "true"}, body)
+            result = page_from_response(found, paging).map(lambda row: shape_ticket(Ticket.parse(row), links))
         except ZammadError as error:
             return to_tool_error(error)
-        result = page_from_response(found, paging).map(lambda row: shape_ticket(Ticket.model_validate(row), links))
         return {**result.to_dict("tickets"), "notice": UNTRUSTED_NOTICE}
 
     @mcp.tool(**context.tool("Get ticket", READ, module=MODULE, tier=Tier.CUSTOMER))
@@ -172,11 +184,11 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             ticket_id = await find_ticket_id(session, ticket)
-            shaped = shape_ticket(Ticket.model_validate(await session.get(f"/tickets/{ticket_id}", EXPAND)), links)
+            shaped = shape_ticket(Ticket.parse(await session.get(f"/tickets/{ticket_id}", EXPAND)), links)
             if recent_articles:
-                rows = await session.get(f"/ticket_articles/by_ticket/{ticket_id}", EXPAND) or []
+                rows = as_list(await session.get(f"/ticket_articles/by_ticket/{ticket_id}", EXPAND))
                 newest = list(reversed(rows))[:recent_articles]
-                shaped["recent_articles"] = [shape_article(Article.model_validate(row), links) for row in newest]
+                shaped["recent_articles"] = [shape_article(Article.parse(row), links) for row in newest]
         except TicketReferenceError as error:
             return f"Error: {error}"
         except ZammadError as error:
@@ -193,12 +205,12 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             if session.lacks(Tier.AGENT):
-                return tier_error(Tier.AGENT)
-            history = await session.get(f"/ticket_history/{ticket_id}") or {}
+                return tier_error(Tier.AGENT, session.tier)
+            history = as_dict(await session.get(f"/ticket_history/{ticket_id}"))
         except ZammadError as error:
             return to_tool_error(error)
-        assets = history.get("assets") or {}
-        entries = list(reversed(history.get("history") or []))
+        assets = as_dict(history.get("assets"))
+        entries = [entry for entry in reversed(as_list(history.get("history"))) if isinstance(entry, dict)]
         result = paginate_locally(entries, PageRequest.of(page, per_page))
         return result.map(lambda entry: shape_history(entry, assets)).to_dict("history")
 
@@ -226,8 +238,12 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             is_customer = session.tier == Tier.CUSTOMER
-            if is_customer and (state or priority):
-                return "Error: customers cannot set state or priority; pass only title, group and body"
+            if customer or state or priority:
+                refusal = agent_only_refusal(session, "set the customer, state or priority")
+                if refusal:
+                    return refusal
+            elif session.tier == Tier.AGENT:
+                return "Error: agents must name the customer (a Zammad user id or email address)"
             payload: dict[str, Any] = {
                 "title": title,
                 "group": group,
@@ -239,17 +255,16 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
                     "content_type": "text/plain",
                 },
             }
-            if customer and not is_customer:
+            if customer:
                 payload["customer_id"] = _customer_reference(customer)
             elif session.tier == Tier.AGENT:
                 return "Error: agents must name the customer (a Zammad user id or email address)"
             payload.update({key: value for key, value in (("state", state), ("priority", priority)) if value})
-            created = await session.post("/tickets", payload, EXPAND)
+            return shape_ticket(Ticket.parse(await session.post("/tickets", payload, EXPAND)), links)
         except TicketReferenceError as error:
             return f"Error: {error}"
         except ZammadError as error:
             return to_tool_error(error)
-        return shape_ticket(Ticket.model_validate(created), links)
 
     @mcp.tool(**context.tool("Update ticket", OVERWRITE, module=MODULE, tier=Tier.CUSTOMER))
     async def update_ticket(
@@ -280,9 +295,9 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
             return "Error: pass at least one field to change"
         try:
             session = await context.session()
-            if owner_id is not None and session.tier == Tier.CUSTOMER:
-                return "Error: only agents can assign an owner"
-            updated = await session.put(f"/tickets/{ticket_id}", changes, EXPAND)
+            refusal = agent_only_refusal(session, "assign an owner") if owner_id is not None else None
+            if refusal:
+                return refusal
+            return shape_ticket(Ticket.parse(await session.put(f"/tickets/{ticket_id}", changes, EXPAND)), links)
         except ZammadError as error:
             return to_tool_error(error)
-        return shape_ticket(Ticket.model_validate(updated), links)

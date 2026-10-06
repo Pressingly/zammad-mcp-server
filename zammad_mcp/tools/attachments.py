@@ -74,7 +74,7 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         """
         try:
             session = await context.session()
-            article = Article.model_validate(await session.get(f"/ticket_articles/{article_id}", {"expand": "true"}))
+            article = Article.parse(await session.get(f"/ticket_articles/{article_id}", {"expand": "true"}))
         except ZammadError as error:
             return _error(to_tool_error(error))
         if article.ticket_id != ticket_id:

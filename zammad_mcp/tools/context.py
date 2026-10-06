@@ -50,8 +50,29 @@ class ZammadSession:
         return await self.client.download(path, token=self.credential.token, max_bytes=max_bytes)
 
 
-def tier_error(tier: Tier) -> str:
-    return f"Error: this tool needs a Zammad {tier.name.lower()} account; your token belongs to a customer"
+def as_list(value: Any) -> list[Any]:
+    """Zammad answers lists as JSON arrays; treat anything else (``null``, an error object) as empty."""
+    return value if isinstance(value, list) else []
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+UNKNOWN_ROLE = "your Zammad role could not be determined; try again in a minute"
+
+
+def tier_error(needed: Tier, actual: Tier | None) -> str:
+    account = f"your account is {actual.label}" if actual is not None else UNKNOWN_ROLE
+    return f"Error: this tool needs a Zammad {needed.name.lower()} account; {account}"
+
+
+def agent_only_refusal(session: ZammadSession, action: str) -> str | None:
+    """Refuse an agent-only argument unless the caller is known to be an agent (fail closed on an unknown role)."""
+    if session.tier == Tier.AGENT:
+        return None
+    account = f"your account is {session.tier.label}" if session.tier is not None else UNKNOWN_ROLE
+    return f"Error: only agents can {action}; {account}"
 
 
 @dataclass(frozen=True)

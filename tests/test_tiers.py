@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -12,7 +13,7 @@ from starlette.testclient import TestClient
 from tests.conftest import CUSTOMER_ME, FakeZammad
 from tests.helpers import rpc, tool_names
 from zammad_mcp.client.errors import MissingTokenError
-from zammad_mcp.server import build_http_app, build_server
+from zammad_mcp.server import _warm, build_http_app, build_server
 from zammad_mcp.tiers import (
     Tier,
     community_tier_resolver,
@@ -56,7 +57,14 @@ def test_has_permission(held, wanted, expected):
 def test_tier_for():
     assert tier_for({"ticket.agent", "admin"}) is Tier.AGENT
     assert tier_for({"ticket.customer"}) is Tier.CUSTOMER
-    assert tier_for(set()) is Tier.CUSTOMER
+    assert tier_for({"ticket"}) is Tier.AGENT
+
+
+@pytest.mark.parametrize("permissions", [set(), {"admin", "knowledge_base.editor", "report", "user_preferences"}])
+def test_admin_without_ticket_permissions_is_not_called_a_customer(permissions):
+    assert tier_for(permissions) is Tier.NONE
+    assert Tier.NONE.label == "an account without ticket permissions"
+    assert required_tier({"tier:none"}) is Tier.NONE
 
 
 def test_required_tier_reads_tags():
@@ -135,12 +143,45 @@ async def test_stdio_short_circuits_filtering(settings):
 
 
 @pytest.mark.parametrize(("filter_by_role", "visible"), [(False, True), (True, False)])
-def test_http_tools_list_without_auth_provider(settings, filter_by_role, visible):
+def test_http_tools_list_without_auth_provider(shared_settings, filter_by_role, visible):
     """Regression for the token=None path over real streamable HTTP."""
-    server = build_server(
-        dataclasses.replace(settings, filter_tools_by_role=filter_by_role), transport=FakeZammad(me=CUSTOMER_ME)
-    )
-    with TestClient(build_http_app(server)) as client:
+    configured = dataclasses.replace(shared_settings, filter_tools_by_role=filter_by_role)
+    server = build_server(configured, transport=FakeZammad(me=CUSTOMER_ME))
+    with TestClient(build_http_app(server, configured)) as client:
         names = tool_names(rpc(client, "/mcp", "tools/list", {}))
     assert (AGENT_ONLY <= names) is visible
     assert "get_me" in names
+
+
+class CrashingProvider:
+    async def resolve(self):
+        raise RuntimeError("not a ZammadError")
+
+
+async def test_resolver_survives_a_non_zammad_exception():
+    assert await credential_tier_resolver(CrashingProvider())(None) is None
+
+
+async def test_a_crashing_resolver_does_not_blank_the_tool_list(settings):
+    async def crash(_token):
+        raise RuntimeError("bug in a resolver")
+
+    check = require_tier(crash)
+    assert await check(AuthContext(token=None, component=FakeComponent("tier:agent"))) is True
+    mcp = build_server(settings, transport=FakeZammad(), tier_resolver=crash)
+    assert AGENT_ONLY <= {tool.name for tool in await mcp.list_tools()}
+
+
+async def test_startup_warm_up_survives_any_exception():
+    class Exploding:
+        async def warm(self):
+            raise RuntimeError("odd Zammad")
+
+    await _warm(Exploding())
+
+
+async def test_server_starts_when_users_me_has_an_odd_shape(settings):
+    fake = FakeZammad()
+    fake.routes[("GET", "/api/v1/users/me")] = httpx.Response(200, content=b'"just a string"')
+    async with Client(build_server(settings, transport=fake)) as client:
+        assert (await client.call_tool("get_me", {})).data.startswith("Error: Zammad returned an unexpected")

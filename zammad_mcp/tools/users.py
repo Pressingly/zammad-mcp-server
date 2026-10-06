@@ -26,7 +26,7 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         """Get one Zammad user. Customers can read themselves and members of their organization."""
         try:
             session = await context.session()
-            user = User.model_validate(await session.get(f"/users/{user_id}", EXPAND))
+            user = User.parse(await session.get(f"/users/{user_id}", EXPAND))
         except ZammadError as error:
             return to_tool_error(error)
         return shape_user(user, links)
@@ -43,12 +43,8 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             session = await context.session()
             if session.lacks(Tier.AGENT):
-                return tier_error(Tier.AGENT)
-            found = await session.get("/users/search", params)
+                return tier_error(Tier.AGENT, session.tier)
+            found = page_from_response(await session.get("/users/search", params), paging)
+            return found.map(lambda row: shape_user(User.parse(row), links)).to_dict("users")
         except ZammadError as error:
             return to_tool_error(error)
-        return (
-            page_from_response(found, paging)
-            .map(lambda row: shape_user(User.model_validate(row), links))
-            .to_dict("users")
-        )

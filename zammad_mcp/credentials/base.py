@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -69,9 +70,9 @@ async def fetch_profile(client: ZammadClient, token: str) -> Profile:
     ``GET /roles/{id}`` is open to ``ticket.agent`` and ``ticket.customer``,
     and ``expand=true`` returns the role's permission names.
     """
-    me = User.model_validate(await client.get("/users/me", token=token, params={"expand": "true"}))
+    me = User.parse(await client.get("/users/me", token=token, params={"expand": "true"}))
     roles = [
-        Role.model_validate(await client.get(f"/roles/{role_id}", token=token, params={"expand": "true"}))
+        Role.parse(await client.get(f"/roles/{role_id}", token=token, params={"expand": "true"}))
         for role_id in me.role_ids
     ]
     permissions = frozenset(permission for role in roles for permission in role.permissions)
@@ -84,8 +85,11 @@ ProfileLoader = Callable[[], Awaitable[Profile]]
 class ProfileMemo:
     """In-process memo of profiles, keyed by credential identity.
 
-    A failed lookup is remembered as unknown for ``failure_ttl`` seconds so a
-    broken role lookup costs one extra request a minute, not one per call.
+    Holds at most ``max_entries`` identities and evicts the least recently
+    stored first. A failed lookup is remembered as unknown for
+    ``failure_ttl`` seconds so a broken role lookup costs one extra request a
+    minute, not one per call. The memo is the one deliberately mutable object
+    here: it is a cache, and copying it on every store would be O(n).
     """
 
     def __init__(
@@ -98,10 +102,18 @@ class ProfileMemo:
     ) -> None:
         self._ttl = ttl_seconds
         self._failure_ttl = failure_ttl_seconds
-        self._max_entries = max_entries
+        self._max_entries = max(1, max_entries)
         self._clock = clock
-        self._entries: dict[str, tuple[Profile, float]] = {}
+        self._entries: OrderedDict[str, tuple[Profile, float]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    @property
+    def lock_count(self) -> int:
+        return len(self._locks)
 
     def _fresh(self, identity: str) -> Profile | None:
         entry = self._entries.get(identity)
@@ -111,28 +123,37 @@ class ProfileMemo:
 
     def _store(self, identity: str, profile: Profile) -> None:
         ttl = self._ttl if profile.known else self._failure_ttl
-        expires_at = float("inf") if ttl is None else self._clock() + ttl
-        if len(self._entries) >= self._max_entries:
-            self._evict_expired()
-        self._entries = {**self._entries, identity: (profile, expires_at)}
+        self._entries[identity] = (profile, float("inf") if ttl is None else self._clock() + ttl)
+        self._entries.move_to_end(identity)
+        while len(self._entries) > self._max_entries:
+            evicted, _ = self._entries.popitem(last=False)
+            self._release_idle_lock(evicted)
 
-    def _evict_expired(self) -> None:
-        now = self._clock()
-        self._entries = {key: entry for key, entry in self._entries.items() if entry[1] > now}
-        self._locks = {key: lock for key, lock in self._locks.items() if key in self._entries}
+    def _release_idle_lock(self, identity: str) -> None:
+        lock = self._locks.get(identity)
+        if lock is not None and not lock.locked():
+            del self._locks[identity]
 
     async def get(self, identity: str, load: ProfileLoader) -> Profile:
         cached = self._fresh(identity)
         if cached is not None:
             return cached
         lock = self._locks.setdefault(identity, asyncio.Lock())
-        async with lock:
-            cached = self._fresh(identity)
-            if cached is not None:
-                return cached
-            try:
-                profile = await load()
-            except ZammadError:
-                profile = UNKNOWN_PROFILE
-            self._store(identity, profile)
-            return profile
+        try:
+            async with lock:
+                cached = self._fresh(identity)
+                if cached is not None:
+                    return cached
+                profile = await _load_or_unknown(load)
+                self._store(identity, profile)
+                return profile
+        finally:
+            if identity not in self._entries:
+                self._release_idle_lock(identity)
+
+
+async def _load_or_unknown(load: ProfileLoader) -> Profile:
+    try:
+        return await load()
+    except ZammadError:
+        return UNKNOWN_PROFILE

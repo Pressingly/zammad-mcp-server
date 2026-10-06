@@ -8,7 +8,7 @@ from fastmcp import FastMCP
 
 from zammad_mcp.client import ZammadError, to_tool_error
 from zammad_mcp.tiers import Tier
-from zammad_mcp.tools.context import READ, ToolContext, ZammadSession
+from zammad_mcp.tools.context import READ, ToolContext, ZammadSession, as_list
 
 EXPAND = {"expand": "true"}
 _SECTIONS = {
@@ -20,7 +20,9 @@ _SECTIONS = {
 
 def _active_options(rows: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
     return [
-        {field: row.get(field) for field in fields if field in row} for row in rows or [] if row.get("active", True)
+        {field: row.get(field) for field in fields if field in row}
+        for row in as_list(rows)
+        if isinstance(row, dict) and row.get("active", True)
     ]
 
 

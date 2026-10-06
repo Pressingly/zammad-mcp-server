@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from typing import Any
@@ -33,6 +34,18 @@ ROLES = {
 @pytest.fixture
 def settings() -> Settings:
     return Settings(zammad_url="https://zammad.test", http_token="secret-token")
+
+
+@pytest.fixture
+def shared_settings(settings) -> Settings:
+    """HTTP settings that opt in to serving ``/mcp`` with the static token."""
+    return dataclasses.replace(settings, http_shared_token_route=True)
+
+
+@pytest.fixture
+def api_key_settings(settings) -> Settings:
+    """HTTP settings with no static token: only ``/http/api-key/mcp`` is served."""
+    return dataclasses.replace(settings, http_token=None)
 
 
 class RecordingTransport(httpx.MockTransport):
