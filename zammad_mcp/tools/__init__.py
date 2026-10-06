@@ -17,12 +17,31 @@ from types import ModuleType
 from fastmcp import FastMCP
 
 from zammad_mcp.config import Settings
-from zammad_mcp.tools import me
+from zammad_mcp.tools import (
+    articles,
+    attachments,
+    me,
+    organizations,
+    reference,
+    search,
+    tags,
+    tickets,
+    users,
+)
 from zammad_mcp.tools.context import ToolContext
 
 __all__ = ["MODULES", "ToolContext", "register_tools"]
 
-MODULES: dict[str, ModuleType] = {}
+MODULES: dict[str, ModuleType] = {
+    "reference": reference,
+    "tickets": tickets,
+    "articles": articles,
+    "attachments": attachments,
+    "search": search,
+    "users": users,
+    "organizations": organizations,
+    "tags": tags,
+}
 
 
 def register_tools(mcp: FastMCP, context: ToolContext, settings: Settings) -> None:

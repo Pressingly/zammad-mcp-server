@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-import pytest
-from fastmcp.server.auth import AuthContext
+import dataclasses
 
+import pytest
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import AuthContext
+from fastmcp.server.context import reset_transport, set_transport
+from starlette.testclient import TestClient
+
+from tests.conftest import CUSTOMER_ME, FakeZammad
+from tests.helpers import rpc, tool_names
 from zammad_mcp.client.errors import MissingTokenError
+from zammad_mcp.server import build_http_app, build_server
 from zammad_mcp.tiers import (
     Tier,
     community_tier_resolver,
@@ -14,6 +23,8 @@ from zammad_mcp.tiers import (
     required_tier,
     tier_for,
 )
+
+AGENT_ONLY = {"search_users", "search_organizations", "get_ticket_history"}
 
 
 class FakeComponent:
@@ -85,3 +96,51 @@ class FailingProvider:
 async def test_credential_resolver_never_raises():
     assert await credential_tier_resolver(FailingProvider())(None) is None
     assert community_tier_resolver(FailingProvider(), filter_by_role=False) is no_filtering
+
+
+async def list_names(settings, fake: FakeZammad) -> set[str]:
+    async with Client(build_server(settings, transport=fake)) as client:
+        return {tool.name for tool in await client.list_tools()}
+
+
+async def test_community_mode_shows_agent_tools_to_customers(settings, customer_fake):
+    assert AGENT_ONLY <= await list_names(settings, customer_fake)
+
+
+async def test_filter_by_role_hides_agent_tools_from_customers(settings, customer_fake):
+    filtered = dataclasses.replace(settings, filter_tools_by_role=True)
+    names = await list_names(filtered, customer_fake)
+    assert not AGENT_ONLY & names
+    assert {"get_me", "search_tickets", "get_ticket"} <= names
+    async with Client(build_server(filtered, transport=customer_fake)) as client:
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await client.call_tool("search_users", {"query": "a"})
+
+
+async def test_filter_by_role_shows_agent_tools_to_agents(settings, fake):
+    assert AGENT_ONLY <= await list_names(dataclasses.replace(settings, filter_tools_by_role=True), fake)
+
+
+async def test_stdio_short_circuits_filtering(settings):
+    async def always_customer(_token):
+        return Tier.CUSTOMER
+
+    mcp = build_server(settings, transport=FakeZammad(), tier_resolver=always_customer)
+    assert not AGENT_ONLY & {tool.name for tool in await mcp.list_tools()}
+    token = set_transport("stdio")
+    try:
+        assert AGENT_ONLY <= {tool.name for tool in await mcp.list_tools()}
+    finally:
+        reset_transport(token)
+
+
+@pytest.mark.parametrize(("filter_by_role", "visible"), [(False, True), (True, False)])
+def test_http_tools_list_without_auth_provider(settings, filter_by_role, visible):
+    """Regression for the token=None path over real streamable HTTP."""
+    server = build_server(
+        dataclasses.replace(settings, filter_tools_by_role=filter_by_role), transport=FakeZammad(me=CUSTOMER_ME)
+    )
+    with TestClient(build_http_app(server)) as client:
+        names = tool_names(rpc(client, "/mcp", "tools/list", {}))
+    assert (AGENT_ONLY <= names) is visible
+    assert "get_me" in names
