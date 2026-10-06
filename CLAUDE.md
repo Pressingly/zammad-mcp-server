@@ -1,0 +1,62 @@
+# CLAUDE.md
+
+Guidance for Claude Code when working in this repository.
+
+## Project
+
+`zammad-mcp-server`: an MIT-licensed MCP server for the Zammad helpdesk, built on FastMCP. Every Zammad call
+carries a per-user token (`Authorization: Token token=...`), never a shared admin token.
+
+- `zammad_mcp/__main__.py`: `zammad-mcp stdio|http`.
+- `zammad_mcp/server.py`: `build_server(settings)` registers tools; `build_http_app(mcp)` serves `/mcp` and
+  `GET /healthz`.
+- `zammad_mcp/client/`: the async Zammad client. It refuses cookies and raises if an `X-Auth-Request-*` header is
+  about to be sent. Keep both guarantees.
+- `zammad_mcp/tools/`: one module per Zammad domain, each with `register(mcp, context)`.
+- `zammad_mcp/credentials/` (FOSS-512) and `zammad_mcp/platform/` (FOSS-513) are placeholders.
+
+## Commands
+
+```bash
+uv sync
+uv run ruff format .
+uv run ruff check .
+uv run pytest --cov=zammad_mcp --cov-fail-under=80
+docker build --platform linux/amd64 .
+```
+
+## Branch policy
+
+| Branch | Role |
+|---|---|
+| `foss-sandbox` | **Staging and the default branch.** Everything lands here first and is verified on staging. |
+| `foss-main` | **Production.** Prod images are built from here. |
+
+- Work goes feature branch, then a PR into `foss-sandbox`, then a promotion PR from `foss-sandbox` into
+  `foss-main`. Never commit or push directly to either branch, and never target `foss-main` from a feature branch.
+- Promotion PRs use a **merge commit**, never squash or rebase, so the two branches stay convergent.
+- Releases are tags: `vYY.MM.PATCH-rc.N` on `foss-sandbox` builds a staging image, `vYY.MM.PATCH` on `foss-main`
+  builds the prod image (with approval). Never build images on a server.
+
+## Isolation rule
+
+- The community core (`client/`, `credentials/`, `tools/`, `server.py`) works against any Zammad and imports
+  nothing from `platform/`.
+- Platform-only logic (Cognito, token minting, Valkey storage) lives in `platform/` and is reached by a one-line
+  hook, only when `COGNITO_USER_POOL_ID` is set.
+- Disabled tool modules never register. Each module has one `ZAMMAD_ENABLE_*` flag, read through
+  `env_flags.env_flag`.
+
+## Tool conventions
+
+- `snake_case` verb_noun names.
+- All four `ToolAnnotations` hints on every tool; `tests/test_tools.py` enforces it.
+- Tools return an `Error: ...` string instead of raising.
+- Text written by Zammad users (titles, articles, attachments) is untrusted; wrap it as data before returning it.
+
+## Commits and PRs
+
+- [Conventional Commits](https://www.conventionalcommits.org/) for every subject: `type(scope): subject`,
+  imperative, lowercase, no trailing period.
+- No AI attribution anywhere: no `Co-Authored-By` trailer, no "Generated with" line, in commits or PRs.
+- PR descriptions have a `## Description` section and an optional `## Testing` section, written as bullet points.
