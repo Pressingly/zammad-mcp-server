@@ -60,7 +60,7 @@ async def test_get_me_returns_shaped_user(settings, recording_transport):
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [(401, "HTTP 401 (the Zammad token is invalid or expired)"), (403, "HTTP 403"), (500, "HTTP 500")],
+    [(401, "HTTP 401"), (403, "HTTP 403"), (500, "HTTP 500")],
 )
 async def test_get_me_returns_error_string_on_http_error(settings, status, expected):
     transport = httpx.MockTransport(lambda _r: httpx.Response(status, json={"error": "nope"}))

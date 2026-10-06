@@ -7,7 +7,7 @@ from typing import Any
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from zammad_mcp.client import ZammadError, describe_error
+from zammad_mcp.client import ZammadError, to_tool_error
 from zammad_mcp.tools.context import ToolContext
 
 _USER_FIELDS = ("id", "login", "firstname", "lastname", "email", "organization", "roles", "active")
@@ -32,5 +32,5 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         try:
             user = await context.client.get("/users/me", token=context.token(), params={"expand": "true"})
         except ZammadError as error:
-            return describe_error(error)
+            return to_tool_error(error)
         return shape_user(user)
