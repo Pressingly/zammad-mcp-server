@@ -11,9 +11,10 @@
 - A request hook makes it impossible to send any ``X-Auth-Request-*`` header,
   which an SSO-fronted Zammad would accept as proof of identity.
 - Retries (see :class:`RetryPolicy`): GET, PUT and DELETE retry on connect
-  errors, read timeouts and 502/503/504. POST retries only when the request
-  provably never left the process (``ConnectError`` or ``ConnectTimeout``),
-  so an article or email is never posted twice. A 429 is retried once for
+  errors, read and write failures, protocol errors and 502/503/504. POST
+  retries only when the request provably never left the process
+  (``ConnectError``, ``ConnectTimeout``, ``PoolTimeout``), so an article or
+  email is never posted twice. A 429 is retried once for
   every method, after ``Retry-After``, because Zammad did not process it.
 """
 
@@ -31,19 +32,21 @@ import httpx
 from zammad_mcp.client.errors import (
     ContentTooLargeError,
     IdentityHeaderError,
+    InvalidTokenError,
     MissingTokenError,
     ZammadAPIError,
     ZammadTransportError,
     error_detail,
     error_for_status,
 )
+from zammad_mcp.client.text import is_ascii_digits
 
 IDENTITY_HEADER_PREFIX = "x-auth-request-"
 USER_AGENT = "zammad-mcp-server"
 RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
-PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
-IN_FLIGHT_ERRORS = (httpx.ReadTimeout,)
+PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+IN_FLIGHT_ERRORS = (httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.RemoteProtocolError)
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -61,7 +64,7 @@ class RetryPolicy:
 
     def rate_limit_wait(self, response: httpx.Response) -> float:
         raw = response.headers.get("retry-after", "").strip()
-        seconds = float(raw) if raw.isdigit() else self.rate_limit_default_seconds
+        seconds = float(raw) if is_ascii_digits(raw) else self.rate_limit_default_seconds
         return min(seconds, self.rate_limit_cap_seconds)
 
 
@@ -93,8 +96,17 @@ def _cookieless_jar() -> CookieJar:
     return CookieJar(policy=_RefuseAllCookies())
 
 
+def is_identity_header(name: str) -> bool:
+    """``X-Auth-Request-*`` in any case, with ``_`` treated as ``-`` (some proxies map one to the other)."""
+    return name.lower().replace("_", "-").startswith(IDENTITY_HEADER_PREFIX)
+
+
+def is_valid_token(token: str) -> bool:
+    return token.isascii() and token.isprintable() and " " not in token
+
+
 def _identity_headers(headers: httpx.Headers) -> list[str]:
-    return [name for name in headers if name.lower().startswith(IDENTITY_HEADER_PREFIX)]
+    return [name for name in headers if is_identity_header(name)]
 
 
 async def reject_identity_headers(request: httpx.Request) -> None:
@@ -124,7 +136,7 @@ def _retryable_transport_error(error: httpx.TransportError, retry_safe: bool) ->
 
 def _declared_length(response: httpx.Response) -> int | None:
     raw = response.headers.get("content-length", "")
-    return int(raw) if raw.isdigit() else None
+    return int(raw) if is_ascii_digits(raw) else None
 
 
 class ZammadClient:
@@ -226,6 +238,8 @@ class ZammadClient:
     ) -> httpx.Response:
         if not token:
             raise MissingTokenError("no Zammad API token is configured for this request")
+        if not is_valid_token(token):
+            raise InvalidTokenError("the Zammad API token must be printable ASCII without spaces")
         method = method.upper()
         safe = method in RETRY_SAFE_METHODS if retry_safe is None else retry_safe
         client = self._client()

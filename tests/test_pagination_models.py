@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from zammad_mcp.client.errors import UnexpectedResponseError
 from zammad_mcp.client.models import Article, Attachment, Ticket
 from zammad_mcp.client.pagination import MAX_PER_PAGE, PageRequest, page_from_response, paginate_locally
 
@@ -25,6 +26,20 @@ def test_page_with_total_count():
         "has_more": True,
         "total": 5,
     }
+
+
+def test_non_ascii_digit_total_is_ignored():
+    assert page_from_response({"records": [], "total_count": "\u00b2"}, PageRequest.of()).total is None
+
+
+@pytest.mark.parametrize("body", ["text", {"records": "x"}, 5])
+def test_non_list_bodies_give_an_empty_page(body):
+    assert page_from_response(body, PageRequest.of()).items == []
+
+
+def test_parse_raises_unexpected_response_error():
+    with pytest.raises(UnexpectedResponseError, match="unexpected Ticket shape"):
+        Ticket.parse(None)
 
 
 def test_last_page_with_total_has_no_more():

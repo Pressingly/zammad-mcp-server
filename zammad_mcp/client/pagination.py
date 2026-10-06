@@ -12,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from zammad_mcp.client.text import is_ascii_digits
+
 MAX_PER_PAGE = 100
 DEFAULT_PER_PAGE = 25
 
@@ -68,11 +70,11 @@ def _has_more(request: PageRequest, returned: int, total: int | None) -> bool:
 def page_from_response(body: Any, request: PageRequest) -> Page:
     """Build a :class:`Page` from either a ``{records, total_count}`` body or a bare list."""
     if isinstance(body, dict):
-        records = list(body.get("records") or [])
+        records = body.get("records") if isinstance(body.get("records"), list) else []
         total = body.get("total_count")
-        total = int(total) if isinstance(total, int | str) and str(total).isdigit() else None
+        total = int(total) if isinstance(total, int | str) and is_ascii_digits(str(total)) else None
     else:
-        records = list(body or [])
+        records = body if isinstance(body, list) else []
         total = None
     return Page(records, request.page, request.per_page, _has_more(request, len(records), total), total)
 

@@ -25,6 +25,14 @@ class MissingTokenError(ZammadError):
     """No Zammad API token is available for this call."""
 
 
+class InvalidTokenError(ZammadError):
+    """The token cannot be sent as a header (non-ASCII, control characters or spaces)."""
+
+
+class UnexpectedResponseError(ZammadError):
+    """Zammad answered successfully, but not with the shape this server expects."""
+
+
 class ZammadTransportError(ZammadError):
     """The request never produced a response (DNS, connect, timeout)."""
 

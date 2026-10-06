@@ -8,13 +8,23 @@ association names (``state``, ``group``, ``owner``) next to the ``*_id``s.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from zammad_mcp.client.errors import UnexpectedResponseError
 
 
 class ZammadModel(BaseModel):
     model_config = ConfigDict(extra="allow", coerce_numbers_to_str=True, populate_by_name=True)
+
+    @classmethod
+    def parse(cls, data: Any) -> Self:
+        """Validate a Zammad response, raising :class:`UnexpectedResponseError` instead of pydantic's error."""
+        try:
+            return cls.model_validate(data)
+        except ValidationError as exc:
+            raise UnexpectedResponseError(f"Zammad returned an unexpected {cls.__name__} shape") from exc
 
 
 class Attachment(ZammadModel):

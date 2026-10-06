@@ -11,6 +11,7 @@ from zammad_mcp.client.errors import (
     ContentTooLargeError,
     GatewayDeniedError,
     IdentityHeaderError,
+    InvalidTokenError,
     MaintenanceModeError,
     MissingTokenError,
     NotFoundError,
@@ -24,7 +25,7 @@ from zammad_mcp.client.errors import (
     error_for_status,
     to_tool_error,
 )
-from zammad_mcp.client.http import RetryPolicy, ZammadClient
+from zammad_mcp.client.http import RetryPolicy, ZammadClient, _declared_length
 
 
 def ok(_request: httpx.Request) -> httpx.Response:
@@ -68,7 +69,16 @@ async def test_sends_token_per_call(recording_transport):
     assert str(transport.requests[0].url) == "https://zammad.test/api/v1/users/me"
 
 
-@pytest.mark.parametrize("header", ["X-Auth-Request-Email", "x-auth-request-access-token", "X-AUTH-REQUEST-User"])
+@pytest.mark.parametrize(
+    "header",
+    [
+        "X-Auth-Request-Email",
+        "x-auth-request-access-token",
+        "X-AUTH-REQUEST-User",
+        "X_Auth_Request_Email",
+        "x-auth_request-user",
+    ],
+)
 async def test_identity_header_guard_raises(recording_transport, header):
     transport = recording_transport(ok)
     client = make_client(transport)
@@ -127,8 +137,12 @@ async def test_aclose_allows_reuse(recording_transport):
 RETRY_SAFE = ["GET", "PUT", "DELETE"]
 
 
+IN_FLIGHT = [httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.RemoteProtocolError]
+PRE_SEND = [httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout]
+
+
 @pytest.mark.parametrize("method", RETRY_SAFE)
-@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout, 502, 503, 504])
+@pytest.mark.parametrize("failure", [*PRE_SEND, *IN_FLIGHT, 502, 503, 504])
 async def test_retry_safe_methods_retry_transient_failures(recording_transport, method, failure):
     transport = recording_transport(failing_then_ok(failure, times=2))
     sleeps = Sleeps()
@@ -161,14 +175,14 @@ async def test_500_is_not_retried(recording_transport):
     assert len(transport.requests) == 1
 
 
-@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ConnectTimeout])
+@pytest.mark.parametrize("failure", PRE_SEND)
 async def test_post_retries_when_the_request_never_left(recording_transport, failure):
     transport = recording_transport(failing_then_ok(failure, times=1))
     assert await make_client(transport).request("POST", "/ticket_articles", token="t", json={}) == {"ok": True}
     assert len(transport.requests) == 2
 
 
-@pytest.mark.parametrize("failure", [httpx.ReadTimeout, 502, 503, 504])
+@pytest.mark.parametrize("failure", [*IN_FLIGHT, 502, 503, 504])
 async def test_post_is_never_retried_once_sent(recording_transport, failure):
     transport = recording_transport(failing_then_ok(failure, times=1))
     with pytest.raises(ZammadError):
@@ -183,7 +197,10 @@ async def test_read_only_post_can_opt_into_retries(recording_transport):
     assert len(transport.requests) == 2
 
 
-@pytest.mark.parametrize(("retry_after", "expected"), [("3", 3.0), ("120", 10.0), ("", 1.0), ("Wed, 21 Oct 2026", 1.0)])
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [("3", 3.0), ("120", 10.0), ("", 1.0), ("Wed, 21 Oct 2026", 1.0), ("\u00b2", 1.0)],
+)
 @pytest.mark.parametrize("method", ["GET", "POST"])
 async def test_429_honours_retry_after_once(recording_transport, method, retry_after, expected):
     calls = []
@@ -191,7 +208,7 @@ async def test_429_honours_retry_after_once(recording_transport, method, retry_a
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(429, headers={"Retry-After": retry_after})
+            return httpx.Response(429, headers={"Retry-After": retry_after.encode()})
         return httpx.Response(200, json={"ok": True})
 
     sleeps = Sleeps()
@@ -346,3 +363,17 @@ async def test_empty_list_is_data_not_an_error(recording_transport):
     """A token with a blank permission list gets 200 [] from list endpoints, not 403."""
     transport = recording_transport(lambda _r: httpx.Response(200, json=[]))
     assert await make_client(transport).get("/tickets", token="t") == []
+
+
+@pytest.mark.parametrize("token", ["t\u00e9st", "has space", "line\nbreak", "tab\t"])
+async def test_tokens_that_cannot_be_a_header_are_refused_before_sending(recording_transport, token):
+    transport = recording_transport(ok)
+    with pytest.raises(InvalidTokenError, match="printable ASCII"):
+        await make_client(transport).get("/users/me", token=token)
+    assert transport.requests == []
+
+
+async def test_non_ascii_content_length_is_ignored_not_crashed(recording_transport):
+    transport = recording_transport(lambda _r: httpx.Response(200, content=b"abc", headers={"Content-Length": "3"}))
+    assert (await make_client(transport).download("/a", token="t", max_bytes=10)).content == b"abc"
+    assert _declared_length(httpx.Response(200, headers={"Content-Length": "\u00b2".encode()})) is None
