@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 
 from fastmcp.server.auth import AuthCheck, AuthContext
 
+from zammad_mcp.client.errors import ZammadError
+
 if TYPE_CHECKING:
     from fastmcp.server.auth import AccessToken
 
@@ -114,6 +116,8 @@ def credential_tier_resolver(credentials: CredentialProvider) -> TierResolver:
     async def resolve(_token: AccessToken | None) -> Tier | None:
         try:
             return (await credentials.resolve()).tier
+        except ZammadError:
+            return None
         except Exception:
             logger.warning("could not resolve the caller's tier; showing every tool", exc_info=True)
             return None

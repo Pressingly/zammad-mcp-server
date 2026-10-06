@@ -242,8 +242,6 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
                 refusal = agent_only_refusal(session, "set the customer, state or priority")
                 if refusal:
                     return refusal
-            elif session.tier == Tier.AGENT:
-                return "Error: agents must name the customer (a Zammad user id or email address)"
             payload: dict[str, Any] = {
                 "title": title,
                 "group": group,

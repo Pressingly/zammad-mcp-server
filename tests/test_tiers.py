@@ -185,3 +185,26 @@ async def test_server_starts_when_users_me_has_an_odd_shape(settings):
     fake.routes[("GET", "/api/v1/users/me")] = httpx.Response(200, content=b'"just a string"')
     async with Client(build_server(settings, transport=fake)) as client:
         assert (await client.call_tool("get_me", {})).data.startswith("Error: Zammad returned an unexpected")
+
+
+class ZammadFailingProvider:
+    async def resolve(self):
+        raise MissingTokenError("no token on this request")
+
+
+async def test_resolver_returns_none_quietly_on_a_zammad_error(caplog):
+    caplog.set_level("DEBUG", logger="zammad_mcp")
+    assert await credential_tier_resolver(ZammadFailingProvider())(None) is None
+    assert not [record for record in caplog.records if record.levelname == "WARNING"]
+
+
+def test_unknown_tier_lacks_agent_access():
+    from zammad_mcp.credentials.base import ZammadCredential
+    from zammad_mcp.tiers import Tier
+    from zammad_mcp.tools.context import ZammadSession
+
+    credential = ZammadCredential(token="t", identity="i", tier=None, permissions=frozenset())
+    session = ZammadSession(client=None, credential=credential)
+    assert session.lacks(Tier.AGENT)
+    agent = ZammadSession(client=None, credential=dataclasses.replace(credential, tier=Tier.AGENT))
+    assert not agent.lacks(Tier.AGENT)

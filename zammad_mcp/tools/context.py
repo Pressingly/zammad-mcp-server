@@ -29,7 +29,7 @@ class ZammadSession:
         return self.credential.tier
 
     def lacks(self, tier: Tier) -> bool:
-        return not tier_allows(self.tier, tier)
+        return self.tier is None or not tier_allows(self.tier, tier)
 
     async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self.client.get(path, token=self.credential.token, params=params)
