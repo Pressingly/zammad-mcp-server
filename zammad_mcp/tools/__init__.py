@@ -1,22 +1,32 @@
 """MCP tool modules, one per Zammad domain.
 
 Each module exposes ``register(mcp, context)``. Every tool carries all four
-MCP ``ToolAnnotations`` hints and returns an error string instead of raising.
+MCP ``ToolAnnotations`` hints, a ``tier:*`` tag and a ``module:*`` tag, and
+returns an ``Error: ...`` string instead of raising.
 
-Phase 2 (FOSS-512) adds: reference, tickets, articles, attachments, search,
-users, organizations, tags, kb and email. Phase 6 adds the flagged follow-up
-toolsets (links, mentions, overviews, macros, ...).
+A module whose ``ZAMMAD_ENABLE_<MODULE>`` flag is false never registers, and
+``ZAMMAD_READ_ONLY`` keeps every write tool unregistered. ``get_me`` is
+always on. The next toolsets (tag writes, knowledge base, email replies) and
+the Phase 6 follow-ups each add a module and a flag.
 """
 
 from __future__ import annotations
 
+from types import ModuleType
+
 from fastmcp import FastMCP
 
+from zammad_mcp.config import Settings
 from zammad_mcp.tools import me
 from zammad_mcp.tools.context import ToolContext
 
-__all__ = ["ToolContext", "register_tools"]
+__all__ = ["MODULES", "ToolContext", "register_tools"]
+
+MODULES: dict[str, ModuleType] = {}
 
 
-def register_tools(mcp: FastMCP, context: ToolContext) -> None:
+def register_tools(mcp: FastMCP, context: ToolContext, settings: Settings) -> None:
     me.register(mcp, context)
+    for name, module in MODULES.items():
+        if settings.module_enabled(name):
+            module.register(mcp, context)
