@@ -23,6 +23,16 @@ reasonable time to release a fix before disclosing publicly. We are happy to cre
 - Sending `X-Auth-Request-*` or other trusted identity headers to Zammad.
 - Bypassing a disabled tool flag or a confirmation step.
 
+## Known Zammad behaviour
+
+- **An `X-Auth-Request-Email` header overrides token auth** on an SSO-fronted Zammad: the header opens a session
+  for that user and the token's permissions are ignored. This is why the server refuses to send any
+  `X-Auth-Request-*` header and strips them from requests arriving on `/http/api-key/mcp`.
+- **Customer ticket search matches internal notes.** Without Elasticsearch, Zammad's database search joins every
+  article, so a customer's search can match a word that only appears in an agent's internal note on that
+  customer's own ticket. Only the fact that the ticket matched is revealed, never the note. The server returns
+  tickets, never match snippets.
+
 ## Out of scope
 
 - Prompt injection that only makes the model misuse tools the user already holds, unless it bypasses a
