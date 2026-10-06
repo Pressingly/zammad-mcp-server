@@ -33,6 +33,14 @@ reasonable time to release a fix before disclosing publicly. We are happy to cre
   customer's own ticket. Only the fact that the ticket matched is revealed, never the note. The server returns
   tickets, never match snippets.
 
+## Deployment notes
+
+- **The shared-token route acts as the token's owner.** `/mcp` is only served in http mode when
+  `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`, and then every caller who can reach the port works in Zammad as the owner of
+  `ZAMMAD_HTTP_TOKEN`, with no authentication of their own. The server refuses to start in http mode with the token
+  set and the flag off. Multi-user deployments should use `/http/api-key/mcp`, where each caller sends their own
+  token.
+
 ## Out of scope
 
 - Prompt injection that only makes the model misuse tools the user already holds, unless it bypasses a
