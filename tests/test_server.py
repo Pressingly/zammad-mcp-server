@@ -7,14 +7,14 @@ from zammad_mcp import __main__ as cli
 from zammad_mcp.server import build_http_app, build_server
 
 
-def test_healthz_returns_ok(settings):
-    with TestClient(build_http_app(build_server(settings))) as client:
+def test_healthz_returns_ok(settings, fake):
+    with TestClient(build_http_app(build_server(settings, transport=fake))) as client:
         response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_mcp_endpoint_is_mounted(settings):
+def test_mcp_endpoint_is_mounted(settings, fake):
     initialize = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -22,7 +22,7 @@ def test_mcp_endpoint_is_mounted(settings):
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
     }
     headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
-    with TestClient(build_http_app(build_server(settings))) as client:
+    with TestClient(build_http_app(build_server(settings, transport=fake))) as client:
         response = client.post("/mcp", json=initialize, headers=headers)
     assert response.status_code == 200
     assert '"serverInfo"' in response.text
