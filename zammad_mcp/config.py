@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from zammad_mcp.env_flags import env_flag
 
 DEFAULT_HTTP_PORT = 8214
+DEFAULT_CONFIRM_TTL_SECONDS = 600
+TOOL_MODULES = ("reference", "tickets", "articles", "attachments", "search", "users", "organizations", "tags")
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -26,10 +30,22 @@ class Settings:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     http_port: int = DEFAULT_HTTP_PORT
+    public_url: str = ""
+    read_only: bool = False
+    filter_tools_by_role: bool = False
+    confirm_ttl_seconds: int = DEFAULT_CONFIRM_TTL_SECONDS
+    enabled_modules: frozenset[str] = field(default_factory=lambda: frozenset(TOOL_MODULES))
 
     @property
     def api_base_url(self) -> str:
         return f"{self.zammad_url}/api/v1"
+
+    @property
+    def browser_url(self) -> str:
+        return self.public_url or self.zammad_url
+
+    def module_enabled(self, module: str) -> bool:
+        return module in self.enabled_modules
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -45,7 +61,18 @@ class Settings:
                 env, "ZAMMAD_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT_SECONDS
             ),
             http_port=_port(env, "MCP_HTTP_PORT", DEFAULT_HTTP_PORT),
+            public_url=_read(env, "ZAMMAD_PUBLIC_URL").rstrip("/"),
+            read_only=env_flag("ZAMMAD_READ_ONLY", environ=env),
+            filter_tools_by_role=env_flag("ZAMMAD_FILTER_TOOLS_BY_ROLE", environ=env),
+            confirm_ttl_seconds=int(_positive_float(env, "ZAMMAD_CONFIRM_TTL_SECONDS", DEFAULT_CONFIRM_TTL_SECONDS)),
+            enabled_modules=frozenset(
+                module for module in TOOL_MODULES if env_flag(module_flag(module), default=True, environ=env)
+            ),
         )
+
+
+def module_flag(module: str) -> str:
+    return f"ZAMMAD_ENABLE_{module.upper()}"
 
 
 def _read(env: Mapping[str, str], name: str) -> str:
