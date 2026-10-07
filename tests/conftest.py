@@ -96,6 +96,19 @@ class FakeZammad(RecordingTransport):
         return json.loads(self.calls(method, path)[-1].content)
 
 
+def unknown_role_fake() -> FakeZammad:
+    """A customer whose role lookup fails, so the server cannot tell their tier."""
+    fake = FakeZammad(me=CUSTOMER_ME)
+    fake.on("GET", "/roles/3", status=403, json={"error": "Not authorized"})
+    return fake
+
+
+def admin_only_fake() -> FakeZammad:
+    fake = FakeZammad(me={**CUSTOMER_ME, "role_ids": [1]})
+    fake.on("GET", "/roles/1", json={"id": 1, "name": "Admin", "permissions": ["admin", "report"]})
+    return fake
+
+
 @pytest.fixture
 def fake() -> FakeZammad:
     return FakeZammad()

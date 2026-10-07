@@ -9,14 +9,14 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from tests.conftest import CUSTOMER_ME, FakeZammad
-from tests.helpers import unframed
-from zammad_mcp.config import TOOL_MODULES, Settings
+from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
+from tests.helpers import call, data, tools, unframed
+from zammad_mcp.config import TOOL_MODULES
 from zammad_mcp.server import build_server
 from zammad_mcp.tools.tickets import _FILTER_FIELDS, ticket_condition
 
 ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
-WRITE_TOOLS = {"create_ticket", "update_ticket", "add_ticket_note"}
+WRITE_TOOLS = {"create_ticket", "update_ticket", "add_ticket_note", "add_ticket_tag", "remove_ticket_tag"}
 ALL_TOOLS = {
     "get_me",
     "list_ticket_options",
@@ -48,20 +48,6 @@ TICKET = {
 
 def article(article_id: int, body: str = "hello", **extra: Any) -> dict[str, Any]:
     return {"id": article_id, "ticket_id": 4, "body": body, "content_type": "text/plain", "internal": False, **extra}
-
-
-async def tools(settings: Settings, fake: FakeZammad) -> dict[str, Any]:
-    async with Client(build_server(settings, transport=fake)) as client:
-        return {tool.name: tool for tool in await client.list_tools()}
-
-
-async def call(settings: Settings, fake: FakeZammad, name: str, arguments: dict[str, Any] | None = None):
-    async with Client(build_server(settings, transport=fake)) as client:
-        return await client.call_tool(name, arguments or {})
-
-
-async def data(settings: Settings, fake: FakeZammad, name: str, arguments: dict[str, Any] | None = None) -> Any:
-    return (await call(settings, fake, name, arguments)).data
 
 
 # --- registration, annotations and gates ---
@@ -644,18 +630,6 @@ async def test_update_ticket_error(settings, fake):
 
 
 AGENT_ONLY_CREATE_ARGS = [{"state": "closed"}, {"priority": "3 high"}, {"customer": "someone@else.com"}]
-
-
-def unknown_role_fake() -> FakeZammad:
-    fake = FakeZammad(me=CUSTOMER_ME)
-    fake.on("GET", "/roles/3", status=403, json={"error": "Not authorized"})
-    return fake
-
-
-def admin_only_fake() -> FakeZammad:
-    fake = FakeZammad(me={**CUSTOMER_ME, "role_ids": [1]})
-    fake.on("GET", "/roles/1", json={"id": 1, "name": "Admin", "permissions": ["admin", "report"]})
-    return fake
 
 
 @pytest.mark.parametrize("extra", AGENT_ONLY_CREATE_ARGS)

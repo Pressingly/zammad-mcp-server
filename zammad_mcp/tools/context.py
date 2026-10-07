@@ -46,6 +46,9 @@ class ZammadSession:
         """PUT is retried on timeouts, so callers must never put an ``article`` in the body."""
         return await self.client.request("PUT", path, token=self.credential.token, params=params, json=body)
 
+    async def delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return await self.client.request("DELETE", path, token=self.credential.token, params=params)
+
     async def download(self, path: str, *, max_bytes: int) -> Download:
         return await self.client.download(path, token=self.credential.token, max_bytes=max_bytes)
 
@@ -95,6 +98,7 @@ class ToolSpec:
 
 READ = ToolSpec(read_only=True, destructive=False, idempotent=True)
 CREATE = ToolSpec(read_only=False, destructive=False, idempotent=False)
+ADD = ToolSpec(read_only=False, destructive=False, idempotent=True)
 OVERWRITE = ToolSpec(read_only=False, destructive=True, idempotent=True)
 
 
