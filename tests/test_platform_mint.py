@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
+import logging
 from datetime import UTC, date, datetime, timedelta
 
 import httpx
@@ -26,6 +28,7 @@ from zammad_mcp.platform.mint import (
     DEVICE_FINGERPRINT,
     FORBIDDEN_RECHECK_INTERVAL_SECONDS,
     RECHECK_INTERVAL_SECONDS,
+    CacheEntry,
     CustomerTokenAccessError,
     EmptyCeilingError,
     KeyedLocks,
@@ -82,10 +85,16 @@ def store(clock) -> MemoryKeyValue:
     return MemoryKeyValue(clock)
 
 
+NAMESPACE = "test"
+
+
+def cache_for(store) -> TokenCache:
+    return TokenCache(store, fernet_for("client-secret", CACHE_SALT), namespace=NAMESPACE)
+
+
 def make_minter(transport, store, clock, **options) -> TokenMinter:
     endpoint = TokenEndpoint(API, timeout=httpx.Timeout(5.0), transport=transport)
-    cache = TokenCache(store, fernet_for("client-secret", CACHE_SALT))
-    return TokenMinter(endpoint, cache, store, default_email_domain="askii.ai", clock=clock, **options)
+    return TokenMinter(endpoint, cache_for(store), default_email_domain="askii.ai", clock=clock, **options)
 
 
 @pytest.fixture
@@ -237,7 +246,7 @@ async def test_cleanup_deletes_only_this_servers_expired_tokens(minter, zammad):
     await minter.token_for(identity(AGENT))
 
     assert zammad.deleted == [1]
-    (delete,) = zammad.deletes()
+    (delete,) = [request for request in zammad.deletes() if "/user_access_token/" in request.url.path]
     assert delete.headers["cookie"] == f"{COOKIE_NAME}=sid-0"
     assert delete.headers["x-csrf-token"] == "csrf-0"
 
@@ -297,7 +306,7 @@ async def test_cache_expires_after_six_days_and_remints(minter, zammad, clock):
 
 async def test_stale_entry_is_reminted(minter, zammad, store, clock):
     minted = await minter.token_for(identity(AGENT))
-    cache = TokenCache(store, fernet_for("client-secret", CACHE_SALT))
+    cache = cache_for(store)
     await cache.put(identity(AGENT).key, dataclasses.replace(minted, expires_at=date(2026, 10, 8)), clock())
 
     assert (await minter.token_for(identity(AGENT))).token == "minted-2"
@@ -341,7 +350,7 @@ async def test_a_recheck_denial_drops_the_cache_and_fails_closed(minter, zammad,
     with pytest.raises(CustomerTokenAccessError):
         await minter.token_for(identity(CUSTOMER))
 
-    assert await store.get(CACHE_KEY_PREFIX + identity(CUSTOMER).key) is None
+    assert await store.get(cache_for(store).token_key(identity(CUSTOMER).key)) is None
 
 
 async def test_a_recheck_that_empties_the_ceiling_fails_closed(minter, zammad, clock):
@@ -355,9 +364,11 @@ async def test_a_recheck_that_empties_the_ceiling_fails_closed(minter, zammad, c
 
 async def test_forbidden_limiter_allows_one_recheck_per_five_minutes(minter, zammad, clock):
     await minter.token_for(identity(AGENT))
+    clock.advance(1)
 
     assert await minter.note_forbidden(identity(AGENT)) is True
     assert await minter.note_forbidden(identity(AGENT)) is False
+    await minter.token_for(identity(AGENT))
     await minter.token_for(identity(AGENT))
     assert len(zammad.gets()) == 2
 
@@ -399,7 +410,7 @@ async def test_cache_entry_is_encrypted_under_a_hashed_key(minter, store):
     await minter.token_for(identity(AGENT))
 
     ((key, (value, _expires)),) = store._values.items()
-    assert key == CACHE_KEY_PREFIX + hashlib.sha256(AGENT.encode()).hexdigest()
+    assert key == f"{CACHE_KEY_PREFIX}{NAMESPACE}:" + hashlib.sha256(AGENT.encode()).hexdigest()
     assert "minted-1" not in value
     assert AGENT not in value
 
@@ -410,10 +421,15 @@ class BrokenStore(MemoryKeyValue):
         self.fail_get = fail_get
         self.fail_set = fail_set
 
-    async def get(self, key):
+    async def get_many(self, keys):
         if self.fail_get:
             raise ConnectionError("valkey down")
-        return await super().get(key)
+        return await super().get_many(keys)
+
+    async def set_if_absent(self, key, value, ttl_seconds):
+        if self.fail_set:
+            raise ConnectionError("valkey down")
+        return await super().set_if_absent(key, value, ttl_seconds)
 
     async def set(self, key, value, ttl_seconds):
         if self.fail_set:
@@ -447,7 +463,7 @@ async def test_a_failed_cache_drop_is_only_logged(zammad, clock):
 
 
 async def test_an_unreadable_cache_entry_is_reminted(minter, store, zammad):
-    await store.set(CACHE_KEY_PREFIX + identity(AGENT).key, "not-fernet", 60)
+    await store.set(cache_for(store).token_key(identity(AGENT).key), "not-fernet", 60)
 
     assert (await minter.token_for(identity(AGENT))).token == "minted-1"
 
@@ -540,3 +556,191 @@ def test_permission_names_reads_zammads_permission_objects():
 
     assert permission_names(raw) == ("ticket.agent", "knowledge_base.reader", "ticket.customer")
     assert permission_names({"ticket.agent": True}) == ()
+
+
+def assert_signed_out_every_session(zammad: FakeSsoZammad) -> None:
+    assert zammad.sessions
+    assert zammad.live_sessions() == []
+    for request in zammad.signouts():
+        assert request.method == "DELETE"
+        assert request.headers["cookie"].startswith(f"{COOKIE_NAME}=sid-")
+        assert request.headers["x-browser-fingerprint"] == DEVICE_FINGERPRINT
+        assert request.headers["user-agent"] == USER_AGENT
+        assert not [name for name in request.headers if is_identity_header(name)]
+
+
+async def test_every_bootstrap_ends_with_a_signout(minter, zammad, clock):
+    first = await minter.token_for(identity(AGENT))
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    await minter.token_for(identity(AGENT))
+    await minter.renew(identity(AGENT), first.token)
+
+    assert len(zammad.gets()) == 3
+    assert len(zammad.signouts()) == 3
+    assert zammad.signouts()[0].headers["x-csrf-token"] == "csrf-0"
+    assert_signed_out_every_session(zammad)
+
+
+async def test_a_failed_post_still_signs_out(minter, zammad, monkeypatch):
+    monkeypatch.setattr(zammad, "_create", lambda owner, request: httpx.Response(500, json={"error": "boom"}))
+
+    with pytest.raises(MintError):
+        await minter.token_for(identity(AGENT))
+
+    assert_signed_out_every_session(zammad)
+
+
+async def test_a_refused_bootstrap_still_signs_its_session_out(minter, zammad):
+    zammad.users[CUSTOMER].token_access = False
+
+    with pytest.raises(CustomerTokenAccessError):
+        await minter.token_for(identity(CUSTOMER))
+
+    (signout,) = zammad.signouts()
+    assert "x-csrf-token" not in signout.headers
+    assert_signed_out_every_session(zammad)
+
+
+async def test_a_failed_signout_never_fails_the_mint(store, clock):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/signout"):
+            if request.headers["cookie"].endswith("=s1"):
+                raise httpx.ConnectError("gone")
+            return httpx.Response(500, json={"error": "nope"})
+        if request.method == "GET":
+            sid = "s1" if request.headers["x-auth-request-email"] == AGENT else "s2"
+            return httpx.Response(
+                200,
+                json={"tokens": [], "permissions": ["ticket.agent"]},
+                headers={"set-cookie": f"{COOKIE_NAME}={sid}; secure", "csrf-token": "c"},
+            )
+        return httpx.Response(200, json={"token": "ok"})
+
+    minter = make_minter(httpx.MockTransport(handler), store, clock)
+
+    assert (await minter.token_for(identity(AGENT))).token == "ok"
+    assert (await minter.token_for(identity(CUSTOMER))).token == "ok"
+
+
+async def test_no_signout_without_a_session(store, clock):
+    calls = []
+
+    def down(request):
+        calls.append(request.url.path)
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(ZammadTransportError):
+        await make_minter(httpx.MockTransport(down), store, clock).token_for(identity(AGENT))
+
+    assert calls == ["/api/v1/user_access_token"]
+
+
+async def test_a_real_address_on_the_synthetic_domain_is_minted(minter, zammad):
+    zammad.add("jane@askii.ai", CUSTOMER_PERMISSIONS)
+
+    minted = await minter.token_for(identity("jane@askii.ai", username="sid-42"))
+
+    assert minted.tier is Tier.CUSTOMER
+    assert zammad.gets()[0].headers["x-auth-request-email"] == "jane@askii.ai"
+
+
+async def test_the_exact_synthetic_shape_is_refused(minter, zammad):
+    with pytest.raises(SyntheticIdentityError):
+        await minter.token_for(identity("sid-42@askii.ai", username="sid-42"))
+
+    assert zammad.requests == []
+
+
+async def test_a_forbidden_marker_never_overwrites_a_concurrent_remint(minter, zammad, store, clock):
+    first = await minter.token_for(identity(AGENT))
+    clock.advance(1)
+    zammad.revoked.add(first.token)
+
+    renewed, marked = await asyncio.gather(
+        minter.renew(identity(AGENT), first.token), minter.note_forbidden(identity(AGENT))
+    )
+
+    cached = (await cache_for(store).load(identity(AGENT).key)).minted
+    assert marked is True
+    assert renewed.token == cached.token == "minted-2"
+
+    clock.advance(1)
+    assert (await minter.token_for(identity(AGENT))).token == "minted-2"
+    assert len(zammad.gets()) == 2, "a marker no newer than the fresh mint needs no re-check"
+
+
+async def test_a_forbidden_marker_does_not_touch_the_cached_value(minter, store, clock):
+    await minter.token_for(identity(AGENT))
+    key = cache_for(store).token_key(identity(AGENT).key)
+    before = await store.get(key)
+
+    await minter.note_forbidden(identity(AGENT))
+
+    assert await store.get(key) == before
+
+
+async def test_a_broken_marker_store_fails_closed(zammad, clock):
+    with pytest.raises(TokenCacheError):
+        await make_minter(zammad, BrokenStore(clock, fail_set=True), clock).note_forbidden(identity(AGENT))
+
+
+def audit_lines(caplog) -> list[dict]:
+    return [json.loads(record.getMessage()) for record in caplog.records if record.name == "zammad_mcp.audit"]
+
+
+async def test_audit_lines_record_every_token_decision(minter, zammad, clock, caplog):
+    caplog.set_level(logging.INFO, logger="zammad_mcp.audit")
+    customer = identity(CUSTOMER)
+
+    first = await minter.token_for(customer)
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    await minter.token_for(customer)
+    zammad.users[CUSTOMER].permissions = AGENT_PERMISSIONS
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    await minter.token_for(customer)
+    await minter.renew(customer, first.token)
+    await minter.note_forbidden(customer)
+    zammad.users[CUSTOMER].token_access = False
+    with pytest.raises(CustomerTokenAccessError):
+        await minter.renew(customer, "minted-2")
+    with pytest.raises(SyntheticIdentityError):
+        await minter.token_for(identity("x@askii.ai"))
+
+    lines = audit_lines(caplog)
+    assert [(line["event"], line.get("reason")) for line in lines] == [
+        ("token.minted", "first"),
+        ("token.recheck_unchanged", None),
+        ("token.minted", "permissions_changed"),
+        ("token.renew_reused", None),
+        ("token.recheck_requested", "forbidden"),
+        ("token.denied", "CustomerTokenAccessError"),
+        ("token.refused", "synthetic_identity"),
+    ]
+    minted = lines[0]
+    assert minted["identity"] == customer.short_key
+    assert minted["tier"] == "customer"
+    assert minted["permissions"] == ["ticket.customer"]
+    assert minted["token_name"] == "zammad-mcp (auto) 2026-10-07"
+    assert lines[2]["tier"] == "agent"
+    text = caplog.text + "".join(json.dumps(line) for line in lines)
+    assert CUSTOMER not in text
+    assert "minted-1" not in text
+    assert "minted-2" not in text
+
+
+def test_cache_entry_recheck_rules():
+    minted = MintedToken("t", frozenset({"ticket.agent"}), Tier.AGENT, "f", date(2026, 10, 16), 100.0)
+
+    assert CacheEntry(None, 500.0).due_for_recheck(200.0) is False
+    assert CacheEntry(minted, None).due_for_recheck(200.0) is False
+    assert CacheEntry(minted, 100.0).due_for_recheck(200.0) is False
+    assert CacheEntry(minted, 150.0).due_for_recheck(200.0) is True
+
+
+async def test_an_unreadable_marker_is_ignored(minter, store, zammad):
+    await minter.token_for(identity(AGENT))
+    await store.set(cache_for(store).recheck_key(identity(AGENT).key), "not-a-time", 60)
+
+    await minter.token_for(identity(AGENT))
+
+    assert len(zammad.gets()) == 1

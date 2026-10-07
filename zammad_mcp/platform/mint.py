@@ -15,15 +15,23 @@ httpx client of its own and the internal Zammad URL:
    copied by hand into a ``Cookie`` header.
 4. Best effort: delete this user's own *expired* ``zammad-mcp`` tokens.
    A live token is never revoked, since another replica may be using it.
+5. Always, even when a step failed: ``DELETE /signout`` with the session
+   cookie. The middleware made a persistent web session with the user's full
+   role; signing out deletes its row instead of leaving it for Zammad's
+   four-week session reaper.
 
 Every bootstrap request sends the same ``X-Browser-Fingerprint`` and
 ``User-Agent`` (the steady-state client's), so Zammad records one device
 per user and sends at most one new-device email.
 
-The result is cached Fernet-encrypted under ``sha256(identity)`` for six
-days and treated as stale within a day of expiry. It is re-checked every
-four hours and after a permission-gated 403 (at most once per five minutes
-per identity); a changed ceiling re-mints. A 401 drops it and re-mints.
+The result is cached Fernet-encrypted under the deployment namespace and
+``sha256(identity)`` for six days and treated as stale within a day of
+expiry. It is re-checked every four hours, and after a permission-gated 403:
+the 403 only sets a re-check marker (``SET NX EX``, so at most once per five
+minutes per identity) and never rewrites the cached token, so it cannot race
+a concurrent re-mint. A changed ceiling re-mints. A 401 drops it and
+re-mints. Every mint, re-check and denial writes one ``zammad_mcp.audit``
+line, without the token or the email.
 
 Synthetic identities are refused before any request, because the first
 request of any kind would create that user in Zammad. Every other failure
@@ -67,6 +75,7 @@ from zammad_mcp.platform.storage import KeyValue
 from zammad_mcp.tiers import Tier, tier_for
 
 logger = logging.getLogger(__name__)
+audit = logging.getLogger("zammad_mcp.audit")
 
 DEVICE_FINGERPRINT = "zammad-mcp-server-device-v1"
 TOKEN_NAME_PREFIX = "zammad-mcp"
@@ -79,6 +88,8 @@ CACHE_KEY_PREFIX = "zammad-mcp:token:v1:"
 RECHECK_KEY_PREFIX = "zammad-mcp:recheck:v1:"
 CACHE_SALT = "zammad-mcp-token-cache"
 SESSION_COOKIE_PREFIX = "_zammad_session_"
+SIGNOUT_PATH = "/signout"
+DEFAULT_NAMESPACE = "local"
 CUSTOMER_TOKEN_ACCESS_DENIED = "user authorization failed."
 DEFAULT_EMAIL_HEADER = "X-Auth-Request-Email"
 DEFAULT_ACCESS_TOKEN_HEADER = "X-Auth-Request-Access-Token"
@@ -126,6 +137,7 @@ class MintedToken:
     ceiling_fingerprint: str
     expires_at: date
     checked_at: float
+    name: str = ""
 
     @property
     def stale_at(self) -> float:
@@ -147,6 +159,7 @@ class MintedToken:
                 "fingerprint": self.ceiling_fingerprint,
                 "expires_at": self.expires_at.isoformat(),
                 "checked_at": self.checked_at,
+                "name": self.name,
             }
         )
 
@@ -160,6 +173,7 @@ class MintedToken:
             ceiling_fingerprint=str(data["fingerprint"]),
             expires_at=date.fromisoformat(data["expires_at"]),
             checked_at=float(data["checked_at"]),
+            name=str(data.get("name", "")),
         )
 
 
@@ -176,16 +190,48 @@ def token_expiry(now: float) -> date:
     return today_utc(now) + timedelta(days=TOKEN_LIFETIME_DAYS)
 
 
+@dataclass(frozen=True)
+class CacheEntry:
+    minted: MintedToken | None
+    recheck_requested_at: float | None
+
+    def due_for_recheck(self, now: float) -> bool:
+        """Four hours since the last check, or a 403 asked for a re-check after it."""
+        if self.minted is None:
+            return False
+        requested = self.recheck_requested_at
+        return self.minted.due_for_recheck(now) or (requested is not None and requested > self.minted.checked_at)
+
+
+def _parse_timestamp(raw: str | None) -> float | None:
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
 class TokenCache:
-    def __init__(self, store: KeyValue, fernet: Fernet) -> None:
+    """Minted tokens and re-check markers, under one deployment's namespace."""
+
+    def __init__(self, store: KeyValue, fernet: Fernet, *, namespace: str = DEFAULT_NAMESPACE) -> None:
         self._store = store
         self._fernet = fernet
+        self._namespace = namespace
 
-    async def get(self, identity_key: str) -> MintedToken | None:
+    def token_key(self, identity_key: str) -> str:
+        return f"{CACHE_KEY_PREFIX}{self._namespace}:{identity_key}"
+
+    def recheck_key(self, identity_key: str) -> str:
+        return f"{RECHECK_KEY_PREFIX}{self._namespace}:{identity_key}"
+
+    async def load(self, identity_key: str) -> CacheEntry:
         try:
-            raw = await self._store.get(CACHE_KEY_PREFIX + identity_key)
+            raw, marker = await self._store.get_many([self.token_key(identity_key), self.recheck_key(identity_key)])
         except Exception as exc:
             raise TokenCacheError("the Zammad token cache is unavailable; try again shortly") from exc
+        return CacheEntry(self._decode(raw), _parse_timestamp(marker))
+
+    def _decode(self, raw: str | None) -> MintedToken | None:
         if not raw:
             return None
         try:
@@ -197,15 +243,24 @@ class TokenCache:
     async def put(self, identity_key: str, minted: MintedToken, now: float) -> None:
         value = self._fernet.encrypt(minted.to_json().encode()).decode()
         try:
-            await self._store.set(CACHE_KEY_PREFIX + identity_key, value, cache_ttl_seconds(minted, now))
+            await self._store.set(self.token_key(identity_key), value, cache_ttl_seconds(minted, now))
         except Exception as exc:
             raise TokenCacheError("the Zammad token cache is unavailable; try again shortly") from exc
 
     async def drop(self, identity_key: str) -> None:
         try:
-            await self._store.delete(CACHE_KEY_PREFIX + identity_key)
+            await self._store.delete(self.token_key(identity_key))
         except Exception:
             logger.warning("could not drop a token cache entry", exc_info=True)
+
+    async def request_recheck(self, identity_key: str, now: float) -> bool:
+        """Mark the token for a re-check; false while an earlier marker is still within its five minutes."""
+        try:
+            return await self._store.set_if_absent(
+                self.recheck_key(identity_key), repr(now), FORBIDDEN_RECHECK_INTERVAL_SECONDS
+            )
+        except Exception as exc:
+            raise TokenCacheError("the Zammad token cache is unavailable; try again shortly") from exc
 
 
 @dataclass(frozen=True)
@@ -292,6 +347,7 @@ class TokenSession:
         self._client = client
         self._email_header = email_header
         self._access_token_header = access_token_header
+        self._opened: tuple[str, str] | None = None
 
     async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
@@ -304,10 +360,12 @@ class TokenSession:
         if identity.access_token:
             headers[self._access_token_header] = identity.access_token
         response = await self._send("GET", "/user_access_token", headers=headers)
+        cookie, csrf = session_cookie(response), response.headers.get("csrf-token", "").strip()
+        if cookie:
+            self._opened = (cookie, csrf)
         if not response.is_success:
             raise bootstrap_error(response)
         body = _json_object(response)
-        cookie, csrf = session_cookie(response), response.headers.get("csrf-token", "").strip()
         if not cookie or not csrf:
             raise MintError("Zammad did not open a session for the token request; is its SSO middleware enabled?")
         permissions = body.get("permissions")
@@ -332,6 +390,21 @@ class TokenSession:
         if not isinstance(token, str) or not token or not is_valid_token(token):
             raise MintError("Zammad created a token but did not return a usable value")
         return token
+
+    async def sign_out(self) -> bool:
+        """Best effort: end the web session the bootstrap opened, whatever happened in between."""
+        if self._opened is None:
+            return False
+        cookie, csrf = self._opened
+        headers = {"Cookie": cookie, **({"X-CSRF-Token": csrf} if csrf else {})}
+        try:
+            response = await self._send("DELETE", SIGNOUT_PATH, headers=headers)
+        except ZammadError:
+            logger.warning("could not sign the token bootstrap session out of Zammad")
+            return False
+        if not response.is_success:
+            logger.warning("Zammad refused to sign the token bootstrap session out (HTTP %d)", response.status_code)
+        return response.is_success
 
     async def delete_expired(self, grant: SessionGrant, now: float) -> int:
         deleted = 0
@@ -383,7 +456,13 @@ class TokenEndpoint:
             },
         )
         async with client:
-            yield TokenSession(client, email_header=self._email_header, access_token_header=self._access_token_header)
+            session = TokenSession(
+                client, email_header=self._email_header, access_token_header=self._access_token_header
+            )
+            try:
+                yield session
+            finally:
+                await session.sign_out()
 
 
 class KeyedLocks:
@@ -414,12 +493,19 @@ def _is_denial(error: ZammadError) -> bool:
     return isinstance(error, CustomerTokenAccessError | PermissionDenied | AuthError)
 
 
+def _audit(event: str, identity: Identity, minted: MintedToken | None = None, **details: str) -> None:
+    """One JSON line per token decision: the identity hash, never the email or the token."""
+    entry: dict[str, Any] = {"event": f"token.{event}", "identity": identity.short_key, **details}
+    if minted is not None:
+        entry.update(tier=minted.tier.name.lower(), permissions=sorted(minted.permissions), token_name=minted.name)
+    audit.info(json.dumps(entry, sort_keys=True))
+
+
 class TokenMinter:
     def __init__(
         self,
         endpoint: TokenEndpoint,
         cache: TokenCache,
-        limiter: KeyValue,
         *,
         default_email_domain: str | None,
         narrow: CeilingNarrower = narrow_ceiling,
@@ -427,7 +513,6 @@ class TokenMinter:
     ) -> None:
         self._endpoint = endpoint
         self._cache = cache
-        self._limiter = limiter
         self._default_email_domain = default_email_domain
         self._narrow = narrow
         self._clock = clock
@@ -439,45 +524,46 @@ class TokenMinter:
 
     def _refuse_synthetic(self, identity: Identity) -> None:
         if identity.is_synthetic(self._default_email_domain):
+            _audit("refused", identity, reason="synthetic_identity")
             raise SyntheticIdentityError()
 
     def _usable(self, cached: MintedToken | None) -> bool:
         return cached is not None and not cached.stale(self._clock())
 
+    def _ready(self, entry: CacheEntry) -> bool:
+        return self._usable(entry.minted) and not entry.due_for_recheck(self._clock())
+
     async def token_for(self, identity: Identity) -> MintedToken:
         """The cached token, re-checked or minted when needed."""
         self._refuse_synthetic(identity)
-        cached = await self._cache.get(identity.key)
-        if self._usable(cached) and not cached.due_for_recheck(self._clock()):
-            return cached
+        entry = await self._cache.load(identity.key)
+        if self._ready(entry):
+            return entry.minted
         async with self._locks.hold(identity.key):
-            cached = await self._cache.get(identity.key)
-            if not self._usable(cached):
-                return await self._mint(identity)
-            if cached.due_for_recheck(self._clock()):
-                return await self._recheck(identity, cached)
-            return cached
+            entry = await self._cache.load(identity.key)
+            if self._ready(entry):
+                return entry.minted
+            if self._usable(entry.minted):
+                return await self._recheck(identity, entry.minted)
+            return await self._mint(identity, reason="stale" if entry.minted else "first")
 
     async def renew(self, identity: Identity, rejected_token: str) -> MintedToken:
         """After a 401: mint a replacement, unless another request already has."""
         self._refuse_synthetic(identity)
         async with self._locks.hold(identity.key):
-            cached = await self._cache.get(identity.key)
+            cached = (await self._cache.load(identity.key)).minted
             if self._usable(cached) and cached.token != rejected_token:
+                _audit("renew_reused", identity, cached)
                 return cached
             await self._cache.drop(identity.key)
-            return await self._mint(identity)
+            return await self._mint(identity, reason="rejected")
 
     async def note_forbidden(self, identity: Identity) -> bool:
-        """After a role-gated 403: make the next call re-check, at most once per five minutes."""
-        if not await self._limiter.set_if_absent(
-            RECHECK_KEY_PREFIX + identity.key, "1", FORBIDDEN_RECHECK_INTERVAL_SECONDS
-        ):
-            return False
-        cached = await self._cache.get(identity.key)
-        if cached is not None:
-            await self._cache.put(identity.key, replace(cached, checked_at=0.0), self._clock())
-        return True
+        """After a role-gated 403: ask for a re-check, at most once per five minutes; the token is left alone."""
+        requested = await self._cache.request_recheck(identity.key, self._clock())
+        if requested:
+            _audit("recheck_requested", identity, reason="forbidden")
+        return requested
 
     async def _open(self, session: TokenSession, identity: Identity) -> SessionGrant:
         try:
@@ -485,12 +571,13 @@ class TokenMinter:
         except ZammadError as error:
             if _is_denial(error):
                 await self._cache.drop(identity.key)
+                _audit("denied", identity, reason=type(error).__name__)
             raise
 
-    async def _mint(self, identity: Identity) -> MintedToken:
+    async def _mint(self, identity: Identity, *, reason: str) -> MintedToken:
         async with self._endpoint.session() as session:
             grant = await self._open(session, identity)
-            return await self._mint_with(session, grant, identity)
+            return await self._mint_with(session, grant, identity, reason=reason)
 
     async def _recheck(self, identity: Identity, cached: MintedToken) -> MintedToken:
         async with self._endpoint.session() as session:
@@ -499,28 +586,27 @@ class TokenMinter:
             if ceiling and ceiling_fingerprint(ceiling) == cached.ceiling_fingerprint:
                 refreshed = replace(cached, checked_at=self._clock())
                 await self._cache.put(identity.key, refreshed, self._clock())
+                _audit("recheck_unchanged", identity, refreshed)
                 return refreshed
-            logger.info("the caller's Zammad permissions changed; minting a new token")
-            return await self._mint_with(session, grant, identity)
+            return await self._mint_with(session, grant, identity, reason="permissions_changed")
 
     def _ceiling(self, grant: SessionGrant, identity: Identity) -> frozenset[str]:
         return ceiling_for(grant.permissions, identity.claims, self._narrow)
 
-    async def _mint_with(self, session: TokenSession, grant: SessionGrant, identity: Identity) -> MintedToken:
+    async def _mint_with(
+        self, session: TokenSession, grant: SessionGrant, identity: Identity, *, reason: str
+    ) -> MintedToken:
         ceiling = self._ceiling(grant, identity)
         try:
             permissions = validate_permissions(ceiling)
         except CeilingError as exc:
             await self._cache.drop(identity.key)
+            _audit("denied", identity, reason="empty_ceiling")
             raise EmptyCeilingError() from exc
         now = self._clock()
         expires_at = token_expiry(now)
-        token = await session.create(
-            grant,
-            name=f"{TOKEN_NAME_PREFIX} (auto) {today_utc(now).isoformat()}",
-            permissions=permissions,
-            expires_at=expires_at,
-        )
+        name = f"{TOKEN_NAME_PREFIX} (auto) {today_utc(now).isoformat()}"
+        token = await session.create(grant, name=name, permissions=permissions, expires_at=expires_at)
         minted = MintedToken(
             token=token,
             permissions=frozenset(permissions),
@@ -528,7 +614,9 @@ class TokenMinter:
             ceiling_fingerprint=ceiling_fingerprint(permissions),
             expires_at=expires_at,
             checked_at=now,
+            name=name,
         )
         await self._cache.put(identity.key, minted, now)
+        _audit("minted", identity, minted, reason=reason)
         await session.delete_expired(grant, now)
         return minted

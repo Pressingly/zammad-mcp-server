@@ -8,7 +8,7 @@ from starlette.testclient import TestClient
 from tests.conftest import RecordingTransport
 from tests.helpers import rpc, tool_names, tool_text
 from tests.platform_fakes import AGENT_PERMISSIONS, CUSTOMER_PERMISSIONS, FakeSsoZammad, identity
-from tests.test_platform_mint import AGENT, CUSTOMER, Clock, make_minter
+from tests.test_platform_mint import AGENT, CUSTOMER, Clock, cache_for, make_minter
 from zammad_mcp.client import ZammadClient
 from zammad_mcp.client.errors import (
     AuthError,
@@ -22,8 +22,8 @@ from zammad_mcp.config import Settings
 from zammad_mcp.credentials.base import ProfileMemo
 from zammad_mcp.platform.cognito import UPSTREAM_CLAIMS_KEY
 from zammad_mcp.platform.credentials import MintedCredentialProvider, is_role_denial, platform_tier_resolver
-from zammad_mcp.platform.mint import RECHECK_KEY_PREFIX, SyntheticIdentityError
-from zammad_mcp.platform.storage import CONFIRMATION_SALT, KeyValueConfirmationBackend, MemoryKeyValue, fernet_for
+from zammad_mcp.platform.mint import SyntheticIdentityError
+from zammad_mcp.platform.storage import MemoryKeyValue
 from zammad_mcp.server import build_server
 from zammad_mcp.tiers import Tier
 
@@ -59,7 +59,6 @@ def platform_app(zammad, clock, who):
         client=client,
         credentials=credentials,
         tier_resolver=platform_tier_resolver(credentials, identity_of=lambda _token: who),
-        confirmation_backend=KeyValueConfirmationBackend(store, fernet_for("s", CONFIRMATION_SALT)),
     )
     return TestClient(mcp.http_app(path="/mcp", stateless_http=True))
 
@@ -106,7 +105,12 @@ def test_tools_list_resolves_the_tier_once_not_once_per_tool(zammad, clock):
 
 
 def steady_state(zammad: FakeSsoZammad) -> list[httpx.Request]:
-    return [request for request in zammad.requests if "/user_access_token" not in request.url.path]
+    bootstrap = ("/user_access_token", "/signout")
+    return [
+        request
+        for request in zammad.requests
+        if not request.url.path.endswith(bootstrap) and "/user_access_token/" not in request.url.path
+    ]
 
 
 def test_steady_state_sends_only_the_token(zammad, clock):
@@ -137,7 +141,7 @@ def test_a_revoked_token_is_reminted_once_and_the_call_succeeds(zammad, clock):
 
 async def test_a_401_after_a_remint_is_not_retried_again(zammad, clock):
     def always_unauthorized(request: httpx.Request) -> httpx.Response:
-        if "/user_access_token" in request.url.path:
+        if "/user_access_token" in request.url.path or request.url.path.endswith("/signout"):
             return zammad._dispatch(request)
         return httpx.Response(401, json={"error": "Not authorized (token expired)!"})
 
@@ -157,11 +161,12 @@ async def test_a_role_denial_arms_one_recheck(zammad, clock):
     credentials, store = provider_for(zammad, clock, identity(CUSTOMER))
     client = ZammadClient(f"{INTERNAL}/api/v1", transport=zammad, on_rejected=credentials.on_rejected)
     token = (await credentials.resolve()).token
+    clock.advance(1)
 
     with pytest.raises(PermissionDenied):
         await client.get("/users/search", token=token)
 
-    assert await store.get(RECHECK_KEY_PREFIX + identity(CUSTOMER).key) == "1"
+    assert await store.get(cache_for(store).recheck_key(identity(CUSTOMER).key)) is not None
     await credentials.resolve()
     assert len(zammad.gets()) == 2
 
@@ -180,7 +185,7 @@ async def test_gateway_and_other_403s_never_arm_a_recheck(zammad, clock):
     credentials, store = provider_for(zammad, clock, identity(AGENT))
 
     assert await credentials.on_rejected(GatewayDeniedError(403, "access_denied"), "t") is None
-    assert await store.get(RECHECK_KEY_PREFIX + identity(AGENT).key) is None
+    assert await store.get(cache_for(store).recheck_key(identity(AGENT).key)) is None
     assert is_role_denial(PermissionDenied(403, "Not authorized"))
     assert not is_role_denial(GatewayDeniedError(403, "access_denied"))
     assert not is_role_denial(ZammadAPIError(500, "x"))

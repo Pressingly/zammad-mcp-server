@@ -28,6 +28,7 @@ CUSTOMER_PERMISSIONS = ("ticket", "ticket.customer", "user_preferences", "user_p
 ADMIN_PERMISSIONS = ("admin", "admin.user", "knowledge_base", "knowledge_base.editor", "report", "user_preferences")
 COOKIE_NAME = "_zammad_session_a138cfd0f37"
 TOKEN_PATH = "/api/v1/user_access_token"
+SIGNOUT_PATH = "/api/v1/signout"
 DELETE_PATH = re.compile(r"^/api/v1/user_access_token/(\d+)$")
 
 
@@ -50,6 +51,7 @@ class FakeSsoZammad(RecordingTransport):
         self.created_users: list[str] = []
         self.corporate_gate = corporate_gate
         self.deleted: list[int] = []
+        self.signed_out: list[str] = []
         self.next_id = 100
         super().__init__(self._dispatch)
 
@@ -82,6 +84,8 @@ class FakeSsoZammad(RecordingTransport):
             if request.method != "GET" or request.url.path != TOKEN_PATH:
                 return _error(401, "CSRF token verification failed.")
             return self._open(email.lower())
+        if request.url.path == SIGNOUT_PATH:
+            return self._signout(request)
         if request.url.path == TOKEN_PATH and request.method == "POST":
             return self._with_session(request, self._create)
         match = DELETE_PATH.match(request.url.path)
@@ -112,10 +116,23 @@ class FakeSsoZammad(RecordingTransport):
         body = {"tokens": user.tokens, "permissions": permissions}
         return httpx.Response(200, json=body, headers={**cookie, "csrf-token": csrf})
 
+    def live_sessions(self) -> list[str]:
+        return [sid for sid in self.sessions if sid not in self.signed_out]
+
+    def signouts(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path == SIGNOUT_PATH]
+
+    def _signout(self, request: httpx.Request) -> httpx.Response:
+        cookie = request.headers.get("cookie", "")
+        sid = cookie.removeprefix(f"{COOKIE_NAME}=")
+        if sid in self.sessions:
+            self.signed_out.append(sid)
+        return httpx.Response(200, json={}, headers={"set-cookie": f"{COOKIE_NAME}=fresh; path=/; secure"})
+
     def _with_session(self, request: httpx.Request, action) -> httpx.Response:
         cookie = request.headers.get("cookie", "")
         sid = cookie.removeprefix(f"{COOKIE_NAME}=") if cookie.startswith(f"{COOKIE_NAME}=") else None
-        if sid not in self.sessions:
+        if sid not in self.sessions or sid in self.signed_out:
             return _error(403, "Authentication required")
         owner, csrf = self.sessions[sid]
         if request.headers.get("x-csrf-token") != csrf:
@@ -155,5 +172,8 @@ def _error(status: int, message: str) -> httpx.Response:
     return httpx.Response(status, json={"error": message})
 
 
-def identity(email: str = "ada@example.com", *, access_token: str | None = "upstream-access") -> Identity:
-    return Identity(email=email, access_token=access_token, claims={"id_token": "id"})
+def identity(
+    email: str = "ada@example.com", *, access_token: str | None = "upstream-access", username: str | None = None
+) -> Identity:
+    claims = {"id_token": "id", **({"cognito:username": username} if username else {})}
+    return Identity(email=email, access_token=access_token, claims=claims)
