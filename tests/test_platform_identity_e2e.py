@@ -15,7 +15,7 @@ from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from key_value.aio.stores.memory import MemoryStore
 
 from tests.helpers import MCP_HEADERS
-from tests.platform_fakes import AGENT_PERMISSIONS, CUSTOMER_PERMISSIONS, FakeSsoZammad
+from tests.platform_fakes import AGENT_PERMISSIONS, COOKIE_NAME, CUSTOMER_PERMISSIONS, FakeSsoZammad
 from zammad_mcp.config import Settings
 from zammad_mcp.platform.http import build_platform_server
 from zammad_mcp.platform.settings import PlatformSettings
@@ -40,6 +40,7 @@ DISCOVERY = OIDCConfiguration(
     token_endpoint="https://auth.example.test/oauth2/token",
     jwks_uri=f"{ISSUER}/.well-known/jwks.json",
 )
+AGENT_ONLY = {"search_users", "search_organizations", "get_ticket_history"}
 USERS = {"ada@example.com": ("sid-ada", AGENT_PERMISSIONS), "jane@askii.ai": ("sid-jane", CUSTOMER_PERMISSIONS)}
 
 
@@ -68,7 +69,7 @@ def server(monkeypatch, zammad):
     return app, mcp.auth, keys
 
 
-async def sign_in(provider, keys: RSAKeyPair, email: str, username: str) -> str:
+async def sign_in(provider, keys: RSAKeyPair, email: str, username: str, *, sealed: dict | None = None) -> str:
     """Store what a finished OAuth flow leaves behind, and return the client's FastMCP token."""
     access = keys.create_token(
         subject=f"uuid-{username}",
@@ -97,15 +98,41 @@ async def sign_in(provider, keys: RSAKeyPair, email: str, username: str) -> str:
     await provider._jti_mapping_store.put(
         key=jti, value=JTIMapping(jti=jti, upstream_token_id=upstream_id, created_at=now)
     )
-    return provider.jwt_issuer.issue_access_token(client_id="mcp-client", scopes=["openid"], jti=jti)
+    return provider.jwt_issuer.issue_access_token(
+        client_id="mcp-client", scopes=["openid"], jti=jti, upstream_claims=sealed
+    )
 
 
-async def call_get_me(client: httpx.AsyncClient, bearer: str) -> str:
-    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_me", "arguments": {}}}
+async def rpc(client: httpx.AsyncClient, bearer: str, method: str, params: dict) -> dict:
+    message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     response = await client.post("/mcp", json=message, headers={**MCP_HEADERS, "Authorization": f"Bearer {bearer}"})
     assert response.status_code == 200, response.text
     data = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
-    return json.loads(data[-1])["result"]["content"][0]["text"]
+    return json.loads(data[-1])["result"]
+
+
+async def call_get_me(client: httpx.AsyncClient, bearer: str) -> str:
+    return (await rpc(client, bearer, "tools/call", {"name": "get_me", "arguments": {}}))["content"][0]["text"]
+
+
+async def list_tools(client: httpx.AsyncClient, bearer: str) -> set[str]:
+    return {tool["name"] for tool in (await rpc(client, bearer, "tools/list", {}))["tools"]}
+
+
+def assert_every_bootstrap_signed_out(zammad: FakeSsoZammad) -> None:
+    """Each bootstrap GET opened session ``sid-<n>``; a later signout must carry that response's cookie."""
+    gets = [index for index, request in enumerate(zammad.requests) if request in zammad.gets()]
+    signouts = {
+        request.headers["cookie"]: index
+        for index, request in enumerate(zammad.requests)
+        if request in zammad.signouts()
+    }
+    assert len(gets) == len(zammad.sessions)
+    for number, get_index in enumerate(gets):
+        cookie = f"{COOKIE_NAME}=sid-{number}"
+        assert cookie in signouts, f"no signout for {cookie}"
+        assert signouts[cookie] > get_index
+    assert zammad.live_sessions() == []
 
 
 async def test_two_concurrent_users_each_get_their_own_identity_and_token(server, zammad):
@@ -127,6 +154,43 @@ async def test_two_concurrent_users_each_get_their_own_identity_and_token(server
     owners = [zammad.minted[request.headers["authorization"].removeprefix("Token token=")][0] for request in steady]
     assert sorted(owners) == sorted(email for email in USERS for _ in range(3))
     assert len(zammad.posts()) == 2
+    assert_every_bootstrap_signed_out(zammad)
+
+
+async def test_concurrent_tool_lists_are_filtered_per_bearer(server, zammad):
+    app, provider, keys = server
+    bearers = {email: await sign_in(provider, keys, email, username) for email, (username, _) in USERS.items()}
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://mcp.test") as client:
+            listings = await asyncio.gather(*(list_tools(client, bearers[email]) for email in USERS for _ in range(3)))
+
+    agent_sets, customer_sets = listings[:3], listings[3:]
+    assert all(names == agent_sets[0] for names in agent_sets)
+    assert all(names == customer_sets[0] for names in customer_sets)
+    assert AGENT_ONLY <= agent_sets[0]
+    assert not AGENT_ONLY & customer_sets[0]
+    assert {"get_me", "search_tickets"} <= customer_sets[0] < agent_sets[0]
+    assert_every_bootstrap_signed_out(zammad)
+
+
+async def test_the_identity_comes_from_the_stored_token_set_not_the_sealed_copy(server, zammad):
+    app, provider, keys = server
+    forged = jwt.encode({"email": "jane@askii.ai", "cognito:username": "sid-jane"}, "k" * 32)
+    bearer = await sign_in(
+        provider,
+        keys,
+        "ada@example.com",
+        "sid-ada",
+        sealed={"id_token": forged, "email": "jane@askii.ai", "cognito:username": "sid-jane"},
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://mcp.test") as client:
+            text = await call_get_me(client, bearer)
+
+    assert "ada@example.com" in text
+    assert [request.headers["x-auth-request-email"] for request in zammad.gets()] == ["ada@example.com"]
 
 
 async def test_a_session_without_a_stored_id_token_is_rejected(server, zammad):
