@@ -7,7 +7,10 @@ import pytest
 
 from zammad_mcp.confirmations import (
     KEY_PREFIX,
+    MAX_BYTES_PER_IDENTITY,
+    MAX_MEMORY_BYTES,
     MAX_OUTSTANDING_PER_IDENTITY,
+    SMALL_RECORD_BYTES,
     ConfirmationError,
     ConfirmationLimitError,
     Confirmations,
@@ -43,6 +46,11 @@ def confirmations(backend, clock) -> Confirmations:
 
 async def issue(confirmations: Confirmations) -> str:
     return await confirmations.issue(identity="id-1", action="send_email_reply", payload=PAYLOAD)
+
+
+def rewrite_record(backend: MemoryConfirmationBackend, **changes) -> None:
+    ((key, entry),) = backend._values.items()
+    backend._values = {key: entry._replace(value=json.dumps({**json.loads(entry.value), **changes}))}
 
 
 async def test_matching_consume_succeeds_once(confirmations):
@@ -91,9 +99,7 @@ async def test_unknown_token_is_refused(confirmations, token):
 
 async def test_corrupted_digest_is_refused(confirmations, backend):
     token = await issue(confirmations)
-    ((key, (raw, expires_at)),) = backend._values.items()
-    record = {**json.loads(raw), "payload_sha256": payload_digest({"something": "else"})}
-    backend._values = {key: (json.dumps(record), expires_at)}
+    rewrite_record(backend, payload_sha256=payload_digest({"something": "else"}))
     with pytest.raises(ConfirmationError, match="does not match"):
         await confirmations.consume(token, identity="id-1", action="send_email_reply", payload=PAYLOAD)
 
@@ -103,7 +109,7 @@ async def test_records_are_keyed_by_token_hash(confirmations, backend):
     (key,) = backend._values
     assert key.startswith(KEY_PREFIX)
     assert token not in key
-    assert token not in backend._values[key][0]
+    assert token not in backend._values[key].value
 
 
 async def test_concurrent_consume_succeeds_exactly_once(confirmations):
@@ -143,11 +149,6 @@ async def issue_kept(confirmations: Confirmations) -> str:
     return await confirmations.issue(identity="id-1", action="email_reply", payload=PAYLOAD, keep_payload=True)
 
 
-def rewrite_record(backend: MemoryConfirmationBackend, **changes) -> None:
-    ((key, (raw, expires_at)),) = backend._values.items()
-    backend._values = {key: (json.dumps({**json.loads(raw), **changes}), expires_at)}
-
-
 async def test_redeem_returns_the_kept_payload_once(confirmations):
     token = await issue_kept(confirmations)
     assert await confirmations.redeem(token, identity="id-1", action="email_reply") == PAYLOAD
@@ -157,8 +158,8 @@ async def test_redeem_returns_the_kept_payload_once(confirmations):
 
 async def test_payload_is_only_kept_on_request(confirmations, backend):
     await issue(confirmations)
-    ((raw, _),) = backend._values.values()
-    assert json.loads(raw)["payload"] is None
+    (entry,) = backend._values.values()
+    assert json.loads(entry.value)["payload"] is None
 
 
 async def test_redeem_without_a_kept_payload_is_refused(confirmations):
@@ -248,3 +249,97 @@ async def test_a_refused_put_releases_the_reservation(clock):
     with pytest.raises(ConfirmationLimitError, match="too many large actions"):
         await issue(confirmations)
     assert confirmations._outstanding == {}
+
+
+# --- byte budgets ---
+
+MACRO = {"macro_id": 1, "ticket_ids": [5, 6]}
+BIG_BODY = "x" * (4 * 1024 * 1024)
+
+
+async def issue_big(confirmations: Confirmations, identity: str = "id-1") -> str:
+    return await confirmations.issue(
+        identity=identity, action="email_reply", payload={"body": BIG_BODY}, keep_payload=True
+    )
+
+
+def test_defaults_leave_room_for_several_users():
+    assert MAX_BYTES_PER_IDENTITY == MAX_MEMORY_BYTES // 4
+    assert SMALL_RECORD_BYTES == 64 * 1024
+
+
+async def test_one_identity_cannot_exhaust_the_pool(clock):
+    backend = MemoryConfirmationBackend(clock=clock)
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock)
+    issued = 0
+    with pytest.raises(ConfirmationLimitError, match="share of the confirmation store"):
+        for _ in range(14):
+            await issue_big(confirmations)
+            issued += 1
+    assert issued == MAX_BYTES_PER_IDENTITY // (len(BIG_BODY) + 200)
+    assert confirmations.held_bytes("id-1") <= MAX_BYTES_PER_IDENTITY
+    stored = sum(entry.size for entry in backend._values.values())
+    assert stored == confirmations.held_bytes("id-1") <= MAX_MEMORY_BYTES // 4
+    await confirmations.issue(identity="id-2", action="apply_macro", payload=MACRO)
+    await issue_big(confirmations, identity="id-2")
+
+
+async def test_second_users_macro_succeeds_while_the_first_is_at_its_budget(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock, max_bytes_per_identity=1000)
+    await confirmations.issue(identity="id-1", action="email_reply", payload={"body": "x" * 800}, keep_payload=True)
+    with pytest.raises(ConfirmationLimitError, match="1000-byte share"):
+        await confirmations.issue(identity="id-1", action="apply_macro", payload={"body": "y" * 300}, keep_payload=True)
+    token = await confirmations.issue(identity="id-2", action="apply_macro", payload=MACRO)
+    await confirmations.consume(token, identity="id-2", action="apply_macro", payload=MACRO)
+
+
+async def test_bytes_are_released_on_take(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock, max_bytes_per_identity=1000)
+    token = await confirmations.issue(identity="id-1", action="a", payload={"body": "x" * 800}, keep_payload=True)
+    assert confirmations.held_bytes("id-1") > 800
+    await confirmations.redeem(token, identity="id-1", action="a")
+    assert confirmations.held_bytes("id-1") == 0
+    await confirmations.issue(identity="id-1", action="a", payload={"body": "x" * 800}, keep_payload=True)
+
+
+async def test_bytes_are_released_on_expiry(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock, max_bytes_per_identity=1000)
+    await confirmations.issue(identity="id-1", action="a", payload={"body": "x" * 800}, keep_payload=True)
+    clock.now += 601
+    assert confirmations.held_bytes("id-1") == 0
+    await confirmations.issue(identity="id-1", action="a", payload={"body": "x" * 800}, keep_payload=True)
+
+
+async def test_bytes_are_released_when_the_backend_refuses(clock):
+    backend = MemoryConfirmationBackend(clock=clock, max_bytes=500, small_record_reserve=0)
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock)
+    with pytest.raises(ConfirmationLimitError, match="too many large actions"):
+        await confirmations.issue(identity="id-1", action="a", payload={"body": "x" * 800}, keep_payload=True)
+    assert confirmations.held_bytes("id-1") == 0
+    assert confirmations._outstanding == {}
+
+
+async def test_sizes_are_utf8_bytes_of_unescaped_json(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock)
+    await confirmations.issue(identity="id-1", action="a", payload={"body": "\U0001f600" * 1000}, keep_payload=True)
+    (entry,) = backend._values.values()
+    assert "\U0001f600" in entry.value
+    assert "\\ud83d" not in entry.value
+    assert entry.size == len(entry.value.encode()) == confirmations.held_bytes("id-1")
+    assert 4000 < entry.size < 4500
+
+
+async def test_lone_surrogates_are_counted_not_rejected(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock)
+    token = await confirmations.issue(identity="id-1", action="a", payload={"body": "\ud800"}, keep_payload=True)
+    assert await confirmations.redeem(token, identity="id-1", action="a") == {"body": "\ud800"}
+
+
+async def test_small_records_keep_a_reserve_large_ones_cannot_use(clock):
+    backend = MemoryConfirmationBackend(clock=clock, max_bytes=200_000, small_record_reserve=100_000)
+    big = "x" * SMALL_RECORD_BYTES
+    await backend.put("a", big, 60)
+    with pytest.raises(ConfirmationLimitError, match="too many large actions"):
+        await backend.put("b", big, 60)
+    for index in range(10):
+        await backend.put(f"small-{index}", "y" * 10_000, 60)

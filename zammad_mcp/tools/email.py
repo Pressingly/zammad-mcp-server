@@ -25,8 +25,8 @@ number, add nothing, so they cannot widen the list. Unless
 ``ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`` every recipient must be a
 participant. None may ever be one of Zammad's own email addresses, and the
 preview carries a warning for every recipient who is not the ticket's
-customer. At most 10 recipients, a 1,000,000-character body and 10 MB of
-attachment content (decoded).
+customer. At most 10 recipients, a 1,000,000-character body and 20
+attachments with 10 MB of content (decoded) in total.
 
 The send POST is never retried once it may have reached Zammad, and the
 spent token cannot be reused, so a reply is never sent twice.
@@ -59,6 +59,7 @@ ACTION = "email_reply"
 MAX_RECIPIENTS = 10
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ATTACHMENT_DATA_CHARS = 4 * MAX_ATTACHMENT_BYTES // 3 + 4
+MAX_ATTACHMENTS = 20
 MAX_EMAIL_BODY_CHARS = 1_000_000
 _LINE_BREAKING = frozenset({"Cc", "Cf", "Zl", "Zp"})
 EXPAND = {"expand": "true"}
@@ -82,7 +83,9 @@ class EmailAttachment(BaseModel):
     mime_type: Annotated[str, Field(min_length=1, max_length=100)] = "application/octet-stream"
 
 
-Recipients = Annotated[list[str], Field(max_length=MAX_RECIPIENTS, description="Email addresses")]
+MAX_ADDRESS_CHARS = 320
+Recipient = Annotated[str, Field(min_length=1, max_length=MAX_ADDRESS_CHARS)]
+Recipients = Annotated[list[Recipient], Field(max_length=MAX_RECIPIENTS, description="Email addresses")]
 
 
 def parse_addresses(values: Iterable[str | None]) -> list[str]:
@@ -315,7 +318,8 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         to: Annotated[Recipients | None, Field(description="Defaults to the ticket customer's email")] = None,
         cc: Recipients | None = None,
         attachments: Annotated[
-            list[EmailAttachment] | None, Field(description="Base64 files, 10 MB of content in total at most")
+            list[EmailAttachment] | None,
+            Field(max_length=MAX_ATTACHMENTS, description="Base64 files, 10 MB of content in total at most"),
         ] = None,
     ) -> dict[str, Any] | str:
         """Prepare an email reply on a ticket and return a preview with a confirmation token. Nothing is sent.

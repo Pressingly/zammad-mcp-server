@@ -17,12 +17,20 @@ from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
 from tests.helpers import rpc, tool_text, tools
 from zammad_mcp import server
 from zammad_mcp.config import Settings
-from zammad_mcp.confirmations import MAX_OUTSTANDING_PER_IDENTITY, Confirmations, MemoryConfirmationBackend
+from zammad_mcp.confirmations import (
+    MAX_BYTES_PER_IDENTITY,
+    MAX_OUTSTANDING_PER_IDENTITY,
+    Confirmations,
+    MemoryConfirmationBackend,
+)
 from zammad_mcp.credentials.base import token_identity
 from zammad_mcp.tools import email as email_tools
 from zammad_mcp.tools.email import (
+    ACTION,
     CONFIRMATION_STORE_DOWN,
+    MAX_ADDRESS_CHARS,
     MAX_ATTACHMENT_DATA_CHARS,
+    MAX_ATTACHMENTS,
     MAX_EMAIL_BODY_CHARS,
     MAX_RECIPIENTS,
     SENT_UNREADABLE,
@@ -202,8 +210,10 @@ async def test_flag_on_registers_both_tools_with_their_annotations(email_setting
 async def test_body_and_attachment_data_are_bounded_in_the_schema(email_settings, zammad):
     schema = (await tools(email_settings, zammad))["prepare_email_reply"].inputSchema
     assert schema["properties"]["body"]["maxLength"] == MAX_EMAIL_BODY_CHARS == 1_000_000
-    attachment = schema["properties"]["attachments"]["anyOf"][0]["items"]
-    assert attachment["properties"]["data"]["maxLength"] == MAX_ATTACHMENT_DATA_CHARS
+    attachments = schema["properties"]["attachments"]["anyOf"][0]
+    assert attachments["maxItems"] == MAX_ATTACHMENTS == 20
+    assert attachments["items"]["properties"]["data"]["maxLength"] == MAX_ATTACHMENT_DATA_CHARS
+    assert schema["properties"]["cc"]["anyOf"][0]["items"]["maxLength"] == MAX_ADDRESS_CHARS
     assert MAX_ATTACHMENT_DATA_CHARS == 4 * email_tools.MAX_ATTACHMENT_BYTES // 3 + 4
 
 
@@ -515,6 +525,26 @@ def test_decoded_size_matches_base64(size):
     assert decoded_size(data) == size
 
 
+async def test_the_largest_possible_reply_fits_one_users_budget():
+    each = email_tools.MAX_ATTACHMENT_BYTES // MAX_ATTACHMENTS
+    data = base64.b64encode(b"x" * each).decode()
+    worst = "\x01"
+    payload = {
+        "ticket_id": 2**31,
+        "to": [worst * MAX_ADDRESS_CHARS] * MAX_RECIPIENTS,
+        "cc": [],
+        "subject": worst * 250,
+        "body": worst * MAX_EMAIL_BODY_CHARS,
+        "attachments": [
+            {"filename": worst * 255, "data": data, "mime-type": worst * 100} for _ in range(MAX_ATTACHMENTS)
+        ],
+    }
+    confirmations = Confirmations(MemoryConfirmationBackend())
+    await confirmations.issue(identity="id", action=ACTION, payload=payload, keep_payload=True)
+    held = confirmations.held_bytes("id")
+    assert 20_000_000 < held < 21_000_000 < MAX_BYTES_PER_IDENTITY
+
+
 def test_the_attachment_limit_is_ten_megabytes():
     assert email_tools.MAX_ATTACHMENT_BYTES == 10 * 1024 * 1024
 
@@ -550,10 +580,10 @@ async def test_corrupted_record_is_detected(email_settings, zammad, store):
     async with Client(server.build_server(email_settings, transport=zammad)) as client:
         preview = (await client.call_tool("prepare_email_reply", PREPARED)).data
         backend = store.backends[0]
-        ((key, (raw, expires_at)),) = backend._values.items()
-        record = json.loads(raw)
+        ((key, entry),) = backend._values.items()
+        record = json.loads(entry.value)
         record["payload"]["to"] = ["attacker@evil.test"]
-        backend._values = {key: (json.dumps(record), expires_at)}
+        backend._values = {key: entry._replace(value=json.dumps(record))}
         sent = (await client.call_tool("send_email_reply", send_args(preview, to=["attacker@evil.test"]))).data
     assert sent == "Error: confirmation record is corrupted; prepare the action again"
     assert zammad.calls("POST", "/ticket_articles") == []
@@ -561,7 +591,8 @@ async def test_corrupted_record_is_detected(email_settings, zammad, store):
 
 async def test_record_holds_the_payload_hash_bound_to_identity_and_action(email_settings, zammad, store):
     preview = await prepare(email_settings, zammad)
-    ((key, (raw, _)),) = store.backends[0]._values.items()
+    ((key, entry),) = store.backends[0]._values.items()
+    raw = entry.value
     record = json.loads(raw)
     assert (record["identity"], record["action"]) == (token_identity("secret-token"), "email_reply")
     assert record["payload"]["ticket_id"] == 4
