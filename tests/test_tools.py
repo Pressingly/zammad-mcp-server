@@ -9,14 +9,14 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from tests.conftest import CUSTOMER_ME, FakeZammad
-from tests.helpers import unframed
-from zammad_mcp.config import TOOL_MODULES, Settings
+from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
+from tests.helpers import call, data, tools, unframed
+from zammad_mcp.config import DEFAULT_ENABLED_MODULES, TOOL_MODULES
 from zammad_mcp.server import build_server
 from zammad_mcp.tools.tickets import _FILTER_FIELDS, ticket_condition
 
 ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
-WRITE_TOOLS = {"create_ticket", "update_ticket", "add_ticket_note"}
+WRITE_TOOLS = {"create_ticket", "update_ticket", "add_ticket_note", "add_ticket_tag", "remove_ticket_tag"}
 ALL_TOOLS = {
     "get_me",
     "list_ticket_options",
@@ -32,6 +32,8 @@ ALL_TOOLS = {
     "get_organization",
     "search_organizations",
     "list_ticket_tags",
+    "search_knowledge_base",
+    "get_kb_answer",
 } | WRITE_TOOLS
 
 TICKET = {
@@ -48,20 +50,6 @@ TICKET = {
 
 def article(article_id: int, body: str = "hello", **extra: Any) -> dict[str, Any]:
     return {"id": article_id, "ticket_id": 4, "body": body, "content_type": "text/plain", "internal": False, **extra}
-
-
-async def tools(settings: Settings, fake: FakeZammad) -> dict[str, Any]:
-    async with Client(build_server(settings, transport=fake)) as client:
-        return {tool.name: tool for tool in await client.list_tools()}
-
-
-async def call(settings: Settings, fake: FakeZammad, name: str, arguments: dict[str, Any] | None = None):
-    async with Client(build_server(settings, transport=fake)) as client:
-        return await client.call_tool(name, arguments or {})
-
-
-async def data(settings: Settings, fake: FakeZammad, name: str, arguments: dict[str, Any] | None = None) -> Any:
-    return (await call(settings, fake, name, arguments)).data
 
 
 # --- registration, annotations and gates ---
@@ -83,6 +71,22 @@ async def test_every_tool_has_annotations_tier_and_module_tags(settings, fake):
         assert any(tag.startswith("module:") for tag in tags), f"{name} has no module tag"
 
 
+OPT_IN_TOOLS = {"prepare_email_reply", "send_email_reply", "list_macros", "prepare_apply_macro", "apply_macro"}
+CONFIRMED_WRITES = {"prepare_email_reply", "send_email_reply", "prepare_apply_macro", "apply_macro"}
+
+
+async def test_every_module_on_gives_every_tool_all_four_annotations(settings, fake):
+    everything = dataclasses.replace(settings, enabled_modules=frozenset(TOOL_MODULES))
+    listed = await tools(everything, fake)
+    assert set(listed) == ALL_TOOLS | OPT_IN_TOOLS
+    for name, tool in listed.items():
+        hints = tool.annotations.model_dump()
+        assert all(isinstance(hints.get(hint), bool) for hint in ANNOTATION_HINTS), name
+        assert any(tag.startswith("tier:") for tag in tool.meta["fastmcp"]["tags"]), name
+    read_only = set(await tools(dataclasses.replace(everything, read_only=True), fake))
+    assert read_only == (ALL_TOOLS | OPT_IN_TOOLS) - WRITE_TOOLS - CONFIRMED_WRITES
+
+
 async def test_read_only_drops_exactly_the_writes(settings, fake):
     names = set(await tools(dataclasses.replace(settings, read_only=True), fake))
     assert names == ALL_TOOLS - WRITE_TOOLS
@@ -98,7 +102,7 @@ async def test_read_only_drops_exactly_the_writes(settings, fake):
     ],
 )
 async def test_module_flag_unregisters_the_module(settings, fake, module, gone):
-    enabled = frozenset(TOOL_MODULES) - {module}
+    enabled = DEFAULT_ENABLED_MODULES - {module}
     names = set(await tools(dataclasses.replace(settings, enabled_modules=enabled), fake))
     assert names == ALL_TOOLS - gone
     assert "get_me" in names
@@ -644,18 +648,6 @@ async def test_update_ticket_error(settings, fake):
 
 
 AGENT_ONLY_CREATE_ARGS = [{"state": "closed"}, {"priority": "3 high"}, {"customer": "someone@else.com"}]
-
-
-def unknown_role_fake() -> FakeZammad:
-    fake = FakeZammad(me=CUSTOMER_ME)
-    fake.on("GET", "/roles/3", status=403, json={"error": "Not authorized"})
-    return fake
-
-
-def admin_only_fake() -> FakeZammad:
-    fake = FakeZammad(me={**CUSTOMER_ME, "role_ids": [1]})
-    fake.on("GET", "/roles/1", json={"id": 1, "name": "Admin", "permissions": ["admin", "report"]})
-    return fake
 
 
 @pytest.mark.parametrize("extra", AGENT_ONLY_CREATE_ARGS)

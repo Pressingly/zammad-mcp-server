@@ -4,7 +4,9 @@ import pytest
 
 from zammad_mcp.config import (
     DEFAULT_CONFIRM_TTL_SECONDS,
+    DEFAULT_ENABLED_MODULES,
     DEFAULT_HTTP_PORT,
+    DEFAULT_OFF_MODULES,
     TOOL_MODULES,
     ConfigError,
     Settings,
@@ -78,7 +80,7 @@ def test_from_env_reads_gates_and_public_url():
     assert settings.read_only is True
     assert settings.filter_tools_by_role is True
     assert settings.confirm_ttl_seconds == 120
-    assert settings.enabled_modules == frozenset(TOOL_MODULES) - {"attachments", "search"}
+    assert settings.enabled_modules == DEFAULT_ENABLED_MODULES - {"attachments", "search"}
     assert not settings.module_enabled("search")
 
 
@@ -87,7 +89,22 @@ def test_gate_defaults():
     assert settings.browser_url == "https://zammad.test"
     assert (settings.read_only, settings.filter_tools_by_role) == (False, False)
     assert settings.confirm_ttl_seconds == DEFAULT_CONFIRM_TTL_SECONDS
-    assert settings.enabled_modules == frozenset(TOOL_MODULES)
+    assert settings.enabled_modules == DEFAULT_ENABLED_MODULES
+    assert settings.email_allow_any_recipient is False
+
+
+def test_default_off_modules_are_off_unless_enabled():
+    assert DEFAULT_OFF_MODULES <= frozenset(TOOL_MODULES)
+    assert not DEFAULT_OFF_MODULES & Settings(zammad_url="https://z.test").enabled_modules
+    settings = Settings.from_env(
+        {
+            "ZAMMAD_URL": "https://z.test",
+            "ZAMMAD_ENABLE_EMAIL_REPLIES": "true",
+            "ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT": "yes",
+        }
+    )
+    assert settings.module_enabled("email_replies")
+    assert settings.email_allow_any_recipient is True
 
 
 @pytest.mark.parametrize("name", ["ZAMMAD_TIMEOUT_SECONDS", "ZAMMAD_CONNECT_TIMEOUT_SECONDS"])

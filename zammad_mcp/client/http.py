@@ -34,7 +34,9 @@ from zammad_mcp.client.errors import (
     IdentityHeaderError,
     InvalidTokenError,
     MissingTokenError,
+    ServerError,
     ZammadAPIError,
+    ZammadError,
     ZammadTransportError,
     error_detail,
     error_for_status,
@@ -113,6 +115,21 @@ async def reject_identity_headers(request: httpx.Request) -> None:
     leaked = _identity_headers(request.headers)
     if leaked:
         raise IdentityHeaderError(f"refusing to send identity header(s) {', '.join(sorted(leaked))} to Zammad")
+
+
+def never_sent(error: ZammadError) -> bool:
+    """The request provably never left the process, so Zammad did nothing."""
+    return isinstance(error, ZammadTransportError) and isinstance(error.__cause__, PRE_SEND_ERRORS)
+
+
+def outcome_unknown(error: ZammadError) -> bool:
+    """Zammad may or may not have acted: the connection failed mid-request, or a 5xx came back."""
+    return isinstance(error, ServerError) or (isinstance(error, ZammadTransportError) and not never_sent(error))
+
+
+def accepted_but_unreadable(error: ZammadError) -> bool:
+    """Zammad answered 2xx, so it acted, but the body could not be decoded."""
+    return isinstance(error, ZammadAPIError) and error.status_code < 300
 
 
 def _json_body(response: httpx.Response) -> Any:
