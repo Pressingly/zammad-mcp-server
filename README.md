@@ -84,7 +84,7 @@ Point the MCP client at `http://<host>:8214/http/api-key/mcp` with the header `X
 | `ZAMMAD_ENABLE_TAGS` | `true` | `list_ticket_tags`, `add_ticket_tag`, `remove_ticket_tag` |
 | `ZAMMAD_ENABLE_KB` | `true` | `search_knowledge_base`, `get_kb_answer` |
 | `ZAMMAD_ENABLE_EMAIL_REPLIES` | `false` | `prepare_email_reply`, `send_email_reply`. Needs an outgoing email channel in Zammad |
-| `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT` | `false` | `true` lets email replies go to any address, not only the ticket's participants |
+| `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT` | `false` | `true` lets email replies go to any address, not only the ticket's participants (never to Zammad's own addresses) |
 | `ZAMMAD_ENABLE_MACROS` | `false` | `list_macros`, `prepare_apply_macro`, `apply_macro` |
 | `ZAMMAD_FILTER_TOOLS_BY_ROLE` | `false` | Hide agent-only tools from customer tokens in the tool list (Zammad enforces permissions either way) |
 | `ZAMMAD_CONFIRM_TTL_SECONDS` | `600` | Lifetime of a two-step confirmation token (email replies and macros) |
@@ -139,25 +139,41 @@ fields (`to` and `subject` for email, `macro_id` and `ticket_ids` for macros), a
 - works once, and is spent even when a check then fails;
 - expires after `ZAMMAD_CONFIRM_TTL_SECONDS`;
 - only works for the user it was issued to;
-- is stored as a hash, next to the sha256 of the exact payload, which is checked again on use.
+- is stored as a hash, next to the sha256 of the exact payload. Recomputing that digest on use detects a corrupted
+  record, not a forged one. Tamper protection for a shared store comes from the platform-mode Valkey backend, which
+  encrypts records with Fernet (authenticated encryption);
+- is limited to 20 waiting per user, and the in-memory store holds at most 64 MiB of them.
 
 Email replies:
 
 - `prepare_email_reply` fails clearly when the ticket's group has no outgoing email address, or the address has no
   active email channel (Zammad: Admin, Groups and Admin, Channels, Email).
-- `to` defaults to the newest customer message's Reply-To, else its From. Unless
-  `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`, every recipient must already be on the ticket: its customer, or an address
-  on one of its articles. At most 10 recipients (to and cc together) and 10 MB of base64 attachments.
+- `to` defaults to the ticket customer's email.
+- A ticket's **participants** are:
+  - the ticket customer's email;
+  - the From, To and Cc of every public article an agent wrote;
+  - the From, To, Cc and Reply-To of every public article the ticket's customer wrote (matched by the article's
+    author or on-behalf-of user, or by its From address).
+
+  Internal notes and messages from anyone else, such as an outsider who emailed in with the ticket number, add no
+  participants. Unless `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`, every recipient must be a participant.
+- No recipient may be one of the Zammad's own email addresses (any group's), with or without
+  `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT`.
+- The preview lists a `recipient_warnings` entry for every recipient who is not the ticket's customer.
+- Limits: at most 10 recipients (to and cc together), a body of 1,000,000 characters, and 10 MB of attachment
+  content (decoded). The subject must be one line without control characters.
 - `send_email_reply` posts one `email` article (sender Agent, not internal) and is never retried once the request
-  may have reached Zammad. Zammad delivers the email in the background, so the result is `queued`. Each send writes
-  one audit log line (`zammad_mcp.audit`) with the caller's identity hash, ticket, article and recipient count,
-  never the body.
+  may have reached Zammad. Zammad delivers the email in the background, so the result is `queued`. When the outcome
+  is unclear (a timeout, a 5xx, or a 2xx whose answer cannot be read) the error says so and asks to check the
+  ticket before preparing the reply again. Each accepted send writes one audit log line (`zammad_mcp.audit`) with
+  the caller's identity hash, ticket, article id (`unknown` when unreadable) and recipient count, never the body.
 
 Macros:
 
 - Only active macros are listed or applied. Zammad itself would run an inactive one.
 - `apply_macro` uses `POST /tickets/mass_macro`, which checks the macro's group restriction and your change access
-  on every ticket and changes nothing if any ticket fails.
+  on every ticket and changes nothing if any ticket fails. After a timeout or a 5xx the error says the macro may or
+  may not have applied.
 
 Every tool declares all four MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
 and returns an `Error: ...` string instead of raising, so the model sees what went wrong.
