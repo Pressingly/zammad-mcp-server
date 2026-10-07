@@ -4,16 +4,19 @@ import json
 import logging
 import sys
 
+import httpx
 import pytest
 from fakeredis import FakeAsyncRedis
 from fastmcp.server.auth.oidc_proxy import OIDCConfiguration, OIDCProxy
+from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from tests.conftest import FakeZammad
-from tests.helpers import rpc, tool_names
+from tests.helpers import MCP_HEADERS, rpc, tool_names
 from zammad_mcp import __main__ as cli
 from zammad_mcp import platform
 from zammad_mcp.config import ConfigError
+from zammad_mcp.credentials.header import API_KEY_MOUNT_PATH
 from zammad_mcp.platform import http as platform_http
 from zammad_mcp.platform.settings import (
     DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
@@ -73,6 +76,7 @@ def test_settings_read_the_platform_env():
     assert settings.production is True
     assert settings.email_header == "X-Forwarded-Email"
     assert settings.access_token_header == "X-Auth-Request-Access-Token"
+    assert settings.http_api_key_route is False
     assert settings.key_material == "cognito-app-secret"
     assert "cognito-app-secret" not in repr(settings)
 
@@ -87,7 +91,13 @@ def test_settings_defaults():
     assert settings.access_token_ttl_seconds == DEFAULT_ACCESS_TOKEN_TTL_SECONDS
     assert settings.cors_origins == ("*",)
     assert settings.log_level == "INFO"
+    assert settings.http_api_key_route is False
     assert settings.key_material == "k"
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), (" TRUE ", True), ("1", True), ("false", False)])
+def test_settings_read_the_api_key_route_flag(raw, expected):
+    assert PlatformSettings.from_env({**ENV, "ZAMMAD_HTTP_API_KEY_ROUTE": raw}).http_api_key_route is expected
 
 
 @pytest.mark.parametrize(
@@ -153,16 +163,66 @@ def app_parts():
     return community_settings(ENV), PlatformSettings.from_env(ENV), fake
 
 
-def test_app_serves_health_discovery_and_both_mcp_routes(app_parts):
+TOOLS_LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+PERSONAL_TOKEN_HEADERS = {**MCP_HEADERS, "X-Zammad-Token": "personal"}
+API_KEY_PATH_VARIANTS = (
+    "/http/api-key/mcp",
+    "/http%2Fapi-key/mcp",
+    "/http%2fapi-key/mcp",
+    "/%68ttp/api-key/mcp",
+    "/http/api-key/mcp/",
+    "/http/api-key",
+)
+
+
+def _api_key_mounts(app) -> list[str]:
+    return [route.path for route in app.routes if route.path.startswith(API_KEY_MOUNT_PATH)]
+
+
+def _assert_platform_routes_work(client: TestClient) -> None:
+    assert client.get("/healthz").json() == {"status": "ok"}
+    metadata = client.get("/.well-known/oauth-authorization-server").json()
+    assert metadata["issuer"].startswith("https://support-mcp.example.test")
+    assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 200
+    assert client.post("/mcp", json=TOOLS_LIST, headers=MCP_HEADERS).status_code == 401
+
+
+def test_app_has_no_personal_token_route_by_default(app_parts):
     settings, platform_settings, fake = app_parts
     app = platform_http.build_platform_app(settings, platform_settings, transport=fake)
 
     with TestClient(app) as client:
-        assert client.get("/healthz").json() == {"status": "ok"}
-        metadata = client.get("/.well-known/oauth-authorization-server").json()
-        assert metadata["issuer"].startswith("https://support-mcp.example.test")
-        unauthenticated = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-        assert unauthenticated.status_code == 401
+        _assert_platform_routes_work(client)
+        statuses = {
+            path: client.post(path, json=TOOLS_LIST, headers=PERSONAL_TOKEN_HEADERS).status_code
+            for path in API_KEY_PATH_VARIANTS
+        }
+
+    assert _api_key_mounts(app) == []
+    assert statuses == dict.fromkeys(API_KEY_PATH_VARIANTS, 404)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("path", ["/http/api-key/mcp", "/http%2Fapi-key/mcp"])
+async def test_encoded_api_key_paths_never_reach_zammad_at_the_asgi_layer(app_parts, path):
+    settings, platform_settings, fake = app_parts
+    app = platform_http.build_platform_app(settings, platform_settings, transport=fake)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="https://support-mcp.example.test") as client:
+        response = await client.post(path, json=TOOLS_LIST, headers=PERSONAL_TOKEN_HEADERS)
+
+    assert response.status_code == 404
+    assert fake.requests == []
+
+
+def test_app_serves_the_personal_token_route_on_the_opt_in(app_parts):
+    settings, _, fake = app_parts
+    platform_settings = PlatformSettings.from_env({**ENV, "ZAMMAD_HTTP_API_KEY_ROUTE": "true"})
+    app = platform_http.build_platform_app(settings, platform_settings, transport=fake)
+
+    with TestClient(app) as client:
+        _assert_platform_routes_work(client)
         listed = rpc(
             client,
             "/http/api-key/mcp",
@@ -170,8 +230,11 @@ def test_app_serves_health_discovery_and_both_mcp_routes(app_parts):
             {},
             headers={"X-Zammad-Token": "personal", "X-Auth-Request-Email": "boss@example.com"},
         )
+        encoded = rpc(client, "/http%2Fapi-key/mcp", "tools/list", {}, headers={"X-Zammad-Token": "personal"})
 
+    assert _api_key_mounts(app) == [API_KEY_MOUNT_PATH]
     assert "get_me" in tool_names(listed)
+    assert tool_names(encoded) == tool_names(listed)
     assert all("x-auth-request-email" not in request.headers for request in fake.requests)
 
 
@@ -219,25 +282,56 @@ def test_configure_logging_installs_one_json_handler(monkeypatch):
 
 @pytest.fixture
 def platform_env(monkeypatch):
-    for key in ("ZAMMAD_HTTP_TOKEN", "ZAMMAD_HTTP_SHARED_TOKEN_ROUTE", "MCP_OAUTH_STORAGE_URL", "MCP_JWT_SIGNING_KEY"):
+    for key in (
+        "ZAMMAD_HTTP_TOKEN",
+        "ZAMMAD_HTTP_SHARED_TOKEN_ROUTE",
+        "ZAMMAD_HTTP_API_KEY_ROUTE",
+        "MCP_OAUTH_STORAGE_URL",
+        "MCP_JWT_SIGNING_KEY",
+        "MCP_HTTP_PORT",
+    ):
         monkeypatch.delenv(key, raising=False)
     for key, value in ENV.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(platform_http, "configure_logging", lambda level: None)
 
 
-def test_run_serves_the_platform_app(monkeypatch, platform_env):
-    monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "valkey://valkey:6379/15")
-    monkeypatch.setenv("MCP_HTTP_PORT", "9214")
+def _run_and_capture(monkeypatch, caplog) -> tuple[Starlette, dict]:
     calls = []
     monkeypatch.setattr(platform_http.uvicorn, "run", lambda app, **kwargs: calls.append((app, kwargs)))
-
-    platform_http.run()
-
+    with caplog.at_level(logging.INFO, logger="zammad_mcp"):
+        platform_http.run()
     ((app, kwargs),) = calls
+    return app, kwargs
+
+
+def test_run_serves_the_platform_app_without_the_personal_token_route(monkeypatch, platform_env, caplog):
+    monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "valkey://valkey:6379/15")
+    monkeypatch.setenv("MCP_HTTP_PORT", "9214")
+
+    app, kwargs = _run_and_capture(monkeypatch, caplog)
+
     assert kwargs["port"] == 9214
-    paths = {getattr(route, "path", None) for route in app.routes}
-    assert {"/healthz", "/http/api-key", ""} <= paths
+    assert {route.path for route in app.routes} == {"/healthz", ""}
+    disabled = [r for r in caplog.records if "personal-token route /http/api-key/mcp is disabled" in r.getMessage()]
+    assert [record.levelno for record in disabled] == [logging.INFO]
+    assert "serving /mcp, /healthz on :9214" in caplog.text
+    assert "bypassing the SSO proxy" not in caplog.text
+
+
+def test_run_mounts_the_personal_token_route_with_a_warning(monkeypatch, platform_env, caplog):
+    monkeypatch.setenv("ZAMMAD_HTTP_API_KEY_ROUTE", "true")
+
+    app, _ = _run_and_capture(monkeypatch, caplog)
+
+    assert {route.path for route in app.routes} == {"/healthz", "/http/api-key", ""}
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "ZAMMAD_HTTP_API_KEY_ROUTE" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "bypassing the SSO proxy (mPass/oauth2-proxy) and the corporate-ID gate" in warnings[0].getMessage()
+    assert "is disabled" not in caplog.text
+    assert "serving /mcp, /http/api-key/mcp, /healthz on :8214" in caplog.text
 
 
 def test_run_exits_on_a_bad_env(monkeypatch, platform_env):

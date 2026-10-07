@@ -1,15 +1,19 @@
 """Platform-mode HTTP entry point.
 
-``zammad-mcp http`` lands here when ``COGNITO_USER_POOL_ID`` is set. Two MCP
-apps share one port:
+``zammad-mcp http`` lands here when ``COGNITO_USER_POOL_ID`` is set. It serves:
 
 - ``/mcp`` (and the OAuth routes at ``/``): FastMCP's Cognito provider is the
   only auth layer. It is a full OAuth 2.0 authorization server (dynamic
   client registration, RFC 8414/9728 discovery, ``/authorize``,
   ``/auth/callback``, ``/token``), and every tool call runs with the caller's
   minted Zammad token.
-- ``/http/api-key/mcp``: the community route, where each caller sends their
-  own token as ``X-Zammad-Token``.
+- ``/http/api-key/mcp``, only with ``ZAMMAD_HTTP_API_KEY_ROUTE=true``: the
+  community route, where each caller sends their own token as
+  ``X-Zammad-Token``. Off by default, because that token is replayed to
+  ``ZAMMAD_INTERNAL_BASE_URL``, past the SSO proxy and the corporate-ID gate,
+  so a leaver's or leaked token would keep working. Not mounting it is the
+  control: a router rule in front can be bypassed with an encoded path
+  (``/http%2Fapi-key/mcp``) that the server decodes before routing.
 
 ``GET /healthz`` answers ``{"status": "ok"}``. Logs are JSON lines on stderr.
 """
@@ -20,13 +24,14 @@ import json
 import logging
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.server.middleware.logging import StructuredLoggingMiddleware
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -139,6 +144,16 @@ def build_platform_server(
     return mcp
 
 
+def build_api_key_app(settings: Settings, transport: httpx.AsyncBaseTransport | None) -> StarletteWithLifespan:
+    """The community server for ``/http/api-key``: each caller's own ``X-Zammad-Token``."""
+    return build_server(settings, transport=transport).http_app(path=MCP_PATH, stateless_http=True)
+
+
+def served_paths(platform: PlatformSettings) -> tuple[str, ...]:
+    api_key_paths = (f"{API_KEY_MOUNT_PATH}{MCP_PATH}",) if platform.http_api_key_route else ()
+    return (MCP_PATH, *api_key_paths, "/healthz")
+
+
 def build_platform_app(
     settings: Settings,
     platform: PlatformSettings,
@@ -146,7 +161,10 @@ def build_platform_app(
     redis: Redis | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> Starlette:
-    """Both MCP apps behind one Starlette app; ``redis=None`` keeps every store in process."""
+    """The platform MCP app behind one Starlette app; ``redis=None`` keeps every store in process.
+
+    ``/http/api-key`` is mounted only when ``platform.http_api_key_route`` is set.
+    """
     store: KeyValue = RedisKeyValue(redis) if redis is not None else MemoryKeyValue()
     oauth_storage = build_oauth_storage(redis, platform.key_material) if redis is not None else None
     confirmations = (
@@ -164,11 +182,14 @@ def build_platform_app(
         confirmation_backend=confirmations,
         transport=transport,
     ).http_app(path=MCP_PATH, stateless_http=True)
-    header_app = build_server(settings, transport=transport).http_app(path=MCP_PATH, stateless_http=True)
+    api_key_apps = [build_api_key_app(settings, transport)] if platform.http_api_key_route else []
+    sub_apps = [platform_app, *api_key_apps]
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        async with platform_app.lifespan(platform_app), header_app.lifespan(header_app):
+        async with AsyncExitStack() as stack:
+            for sub_app in sub_apps:
+                await stack.enter_async_context(sub_app.lifespan(sub_app))
             try:
                 yield
             finally:
@@ -178,7 +199,7 @@ def build_platform_app(
     app = Starlette(
         routes=[
             Route("/healthz", healthz, methods=["GET"]),
-            Mount(API_KEY_MOUNT_PATH, app=api_key_mount(header_app)),
+            *(Mount(API_KEY_MOUNT_PATH, app=api_key_mount(api_key_app)) for api_key_app in api_key_apps),
             Mount("/", app=platform_app),
         ],
         lifespan=lifespan,
@@ -246,7 +267,25 @@ def _log_startup(settings: Settings, platform: PlatformSettings) -> None:
             "and are lost on restart%s",
             " (production)" if platform.production else "",
         )
+    _log_api_key_route(platform)
     logger.info("register this callback URL in the Cognito app client: %s%s", platform.base_url, CALLBACK_PATH)
+
+
+def _log_api_key_route(platform: PlatformSettings) -> None:
+    if not platform.http_api_key_route:
+        logger.info(
+            "personal-token route %s%s is disabled; set ZAMMAD_HTTP_API_KEY_ROUTE=true to serve it",
+            API_KEY_MOUNT_PATH,
+            MCP_PATH,
+        )
+        return
+    logger.warning(
+        "ZAMMAD_HTTP_API_KEY_ROUTE=true: %s%s replays any caller's X-Zammad-Token to ZAMMAD_INTERNAL_BASE_URL, "
+        "bypassing the SSO proxy (mPass/oauth2-proxy) and the corporate-ID gate, so a leaver's or leaked personal "
+        "token keeps working from wherever this server is reachable",
+        API_KEY_MOUNT_PATH,
+        MCP_PATH,
+    )
 
 
 def run() -> None:
@@ -259,5 +298,5 @@ def run() -> None:
     configure_logging(platform.log_level)
     _log_startup(settings, platform)
     app = build_platform_app(settings, platform, redis=redis)
-    logger.info("serving /mcp, /http/api-key/mcp and /healthz on :%d", settings.http_port)
+    logger.info("serving %s on :%d", ", ".join(served_paths(platform)), settings.http_port)
     uvicorn.run(app, host="0.0.0.0", port=settings.http_port, access_log=False, log_config=None)

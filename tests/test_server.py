@@ -94,3 +94,13 @@ def test_stdio_keeps_working_with_a_static_token(monkeypatch, zammad_env):
     monkeypatch.setattr("fastmcp.FastMCP.run", lambda self, *a, **k: runs.append(self.name))
     cli.main(["stdio"])
     assert runs == ["zammad"]
+
+
+@pytest.mark.parametrize("flag", ["", "false"])
+def test_community_http_always_serves_the_personal_token_route(monkeypatch, zammad_env, flag):
+    monkeypatch.setenv("ZAMMAD_HTTP_API_KEY_ROUTE", flag)
+    monkeypatch.delenv("COGNITO_USER_POOL_ID", raising=False)
+    calls = []
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **kwargs: calls.append(app))
+    cli.main(["http"])
+    assert [route.path for route in calls[0].routes] == ["/healthz", "/http/api-key"]
