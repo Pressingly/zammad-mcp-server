@@ -8,9 +8,10 @@ from fakeredis import FakeAsyncRedis
 from zammad_mcp.confirmations import ConfirmationError, Confirmations
 from zammad_mcp.platform.storage import (
     CONFIRMATION_SALT,
-    KeyValueConfirmationBackend,
+    ConfirmationStoreFullError,
     MemoryKeyValue,
     RedisKeyValue,
+    ValkeyConfirmationBackend,
     build_oauth_storage,
     build_redis,
     fernet_for,
@@ -73,6 +74,7 @@ async def test_key_value_contract(store):
     assert await store.set_if_absent("nx", "2", 60) is False
     assert await store.get("nx") == "1"
 
+    assert await store.get_many(["k", "missing", "nx"]) == ["v", None, "1"]
     assert await store.take("k") == "v"
     assert await store.take("k") is None
 
@@ -99,9 +101,26 @@ async def test_memory_store_expires_entries():
     assert await store.set_if_absent("nx", "2", 10) is True
 
 
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 @pytest.fixture
-def confirmations(store) -> Confirmations:
-    return Confirmations(KeyValueConfirmationBackend(store, FERNET), ttl_seconds=600)
+def clock() -> Clock:
+    return Clock()
+
+
+def valkey_backend(redis, clock, **options) -> ValkeyConfirmationBackend:
+    return ValkeyConfirmationBackend(redis, FERNET, namespace="test", clock=clock, **options)
+
+
+@pytest.fixture
+def confirmations(redis, clock) -> Confirmations:
+    return Confirmations(valkey_backend(redis, clock), ttl_seconds=600, clock=clock)
 
 
 async def test_confirmation_is_single_use(confirmations):
@@ -136,14 +155,70 @@ async def test_concurrent_consumes_succeed_once(confirmations):
     assert results.count(True) == 1
 
 
-async def test_valkey_confirmations_are_stored_hashed_with_a_ttl(redis):
-    confirmations = Confirmations(KeyValueConfirmationBackend(RedisKeyValue(redis), FERNET), ttl_seconds=600)
+async def test_valkey_confirmations_are_stored_hashed_with_a_ttl(redis, confirmations):
     token = await confirmations.issue(identity="u", action="merge", payload={})
 
-    (key,) = await redis.keys("*")
+    (key,) = [key for key in await redis.keys("zammad-mcp:confirm:v1:*")]
     assert token not in key
-    assert key.startswith("zammad-mcp:confirm:v1:")
     assert 0 < await redis.ttl(key) <= 600
+
+
+async def test_records_are_encrypted_and_a_maximum_size_record_fits(redis, clock):
+    backend = valkey_backend(redis, clock)
+    record = "attachment:" + "A" * (20 * 1024 * 1024)
+
+    await backend.put("k", record, 600)
+
+    sealed = await redis.get("k")
+    assert "attachment:" not in sealed
+    assert len(sealed) > len(record)
+    assert await backend.held_bytes() == len(record)
+    assert await backend.take("k") == record
+    assert await backend.take("k") is None
+    assert await backend.held_bytes() == 0
+
+
+async def test_a_full_store_refuses_cleanly_and_keeps_room_for_small_records(redis, clock):
+    backend = valkey_backend(redis, clock, max_bytes=1000 * 1024, small_record_reserve=100 * 1024)
+    large = "L" * (400 * 1024)
+    await backend.put("a", large, 600)
+    await backend.put("b", large, 600)
+
+    with pytest.raises(ConfirmationStoreFullError, match="too many large actions"):
+        await backend.put("c", "L" * (150 * 1024), 600)
+    assert await redis.get("c") is None
+
+    await backend.put("small", "s" * (60 * 1024), 600)
+    await backend.put("small-2", "s" * (60 * 1024), 600)
+    assert await backend.take("a") == large
+    await backend.put("c", "L" * (150 * 1024), 600)
+    assert await backend.held_bytes() == (400 + 60 + 60 + 150) * 1024
+
+
+async def test_expired_records_free_their_bytes(redis, clock):
+    backend = valkey_backend(redis, clock, max_bytes=1000 * 1024, small_record_reserve=0)
+    large = "L" * (600 * 1024)
+    await backend.put("a", large, 60)
+
+    clock.now += 61
+
+    await backend.put("b", large, 60)
+    assert await redis.zcard("zammad-mcp:confirm-bytes:v1:test") == 1
+
+
+async def test_rewriting_a_key_counts_it_once(redis, clock):
+    backend = valkey_backend(redis, clock, max_bytes=1000 * 1024, small_record_reserve=0)
+    large = "L" * (600 * 1024)
+
+    await backend.put("a", large, 60)
+    await backend.put("a", large, 60)
+
+
+async def test_a_record_sealed_with_another_key_reads_as_absent(redis, clock):
+    other = ValkeyConfirmationBackend(redis, fernet_for("old", CONFIRMATION_SALT), namespace="test", clock=clock)
+    await other.put("k", "v", 60)
+
+    assert await valkey_backend(redis, clock).take("k") is None
 
 
 async def test_oauth_storage_round_trips_encrypted(redis):
@@ -157,19 +232,17 @@ async def test_oauth_storage_round_trips_encrypted(redis):
     assert all("s3cr3t-plaintext" not in str(item) for item in raw)
 
 
-async def test_confirmation_records_are_encrypted_and_survive_large_payloads(redis):
-    backend = KeyValueConfirmationBackend(RedisKeyValue(redis), FERNET)
-    record = "attachment:" + "A" * (14 * 1024 * 1024)
+async def test_concurrent_puts_never_overshoot_the_cap(redis, clock):
+    backend = valkey_backend(redis, clock, max_bytes=1000 * 1024, small_record_reserve=0)
 
-    await backend.put("k", record, 600)
+    async def put(index: int) -> bool:
+        try:
+            await backend.put(f"k{index}", "L" * (150 * 1024), 600)
+        except ConfirmationStoreFullError:
+            return False
+        return True
 
-    sealed = await redis.get("k")
-    assert "attachment:" not in sealed
-    assert await backend.take("k") == record
-    assert await backend.take("k") is None
+    results = await asyncio.gather(*(put(index) for index in range(12)))
 
-
-async def test_a_record_sealed_with_another_key_reads_as_absent(redis):
-    await KeyValueConfirmationBackend(RedisKeyValue(redis), fernet_for("old", CONFIRMATION_SALT)).put("k", "v", 60)
-
-    assert await KeyValueConfirmationBackend(RedisKeyValue(redis), FERNET).take("k") is None
+    assert results.count(True) == 6
+    assert await backend.held_bytes() == 6 * 150 * 1024

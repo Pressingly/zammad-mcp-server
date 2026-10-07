@@ -34,6 +34,7 @@ from starlette.routing import Mount, Route
 
 from zammad_mcp.client import ZammadClient
 from zammad_mcp.config import ConfigError, Settings
+from zammad_mcp.confirmations import ConfirmationBackend
 from zammad_mcp.credentials import api_key_mount
 from zammad_mcp.credentials.header import API_KEY_MOUNT_PATH
 from zammad_mcp.platform.cognito import ZammadCognitoProvider
@@ -43,9 +44,9 @@ from zammad_mcp.platform.settings import REFRESH_TOKEN_FALLBACK_SECONDS, Platfor
 from zammad_mcp.platform.storage import (
     CONFIRMATION_SALT,
     KeyValue,
-    KeyValueConfirmationBackend,
     MemoryKeyValue,
     RedisKeyValue,
+    ValkeyConfirmationBackend,
     build_oauth_storage,
     build_redis,
     fernet_for,
@@ -99,9 +100,13 @@ def build_platform_server(
     *,
     store: KeyValue,
     oauth_storage: AsyncKeyValue | None,
+    confirmation_backend: ConfirmationBackend | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastMCP:
-    """The Cognito-authenticated server: minted credentials, fail-closed tiers, shared confirmations."""
+    """The Cognito-authenticated server: minted credentials and fail-closed tiers.
+
+    ``confirmation_backend=None`` keeps confirmations in process.
+    """
     endpoint = TokenEndpoint(
         settings.api_base_url,
         timeout=httpx.Timeout(settings.timeout_seconds, connect=settings.connect_timeout_seconds),
@@ -111,8 +116,7 @@ def build_platform_server(
     )
     minter = TokenMinter(
         endpoint,
-        TokenCache(store, fernet_for(platform.key_material, CACHE_SALT)),
-        store,
+        TokenCache(store, fernet_for(platform.key_material, CACHE_SALT), namespace=platform.namespace),
         default_email_domain=platform.default_email_domain,
     )
     credentials = MintedCredentialProvider(minter)
@@ -128,7 +132,7 @@ def build_platform_server(
         client=client,
         credentials=credentials,
         tier_resolver=platform_tier_resolver(credentials),
-        confirmation_backend=KeyValueConfirmationBackend(store, fernet_for(platform.key_material, CONFIRMATION_SALT)),
+        confirmation_backend=confirmation_backend,
         auth=build_cognito_provider(platform, oauth_storage),
     )
     mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=False))
@@ -145,8 +149,20 @@ def build_platform_app(
     """Both MCP apps behind one Starlette app; ``redis=None`` keeps every store in process."""
     store: KeyValue = RedisKeyValue(redis) if redis is not None else MemoryKeyValue()
     oauth_storage = build_oauth_storage(redis, platform.key_material) if redis is not None else None
+    confirmations = (
+        ValkeyConfirmationBackend(
+            redis, fernet_for(platform.key_material, CONFIRMATION_SALT), namespace=platform.namespace
+        )
+        if redis is not None
+        else None
+    )
     platform_app = build_platform_server(
-        settings, platform, store=store, oauth_storage=oauth_storage, transport=transport
+        settings,
+        platform,
+        store=store,
+        oauth_storage=oauth_storage,
+        confirmation_backend=confirmations,
+        transport=transport,
     ).http_app(path=MCP_PATH, stateless_http=True)
     header_app = build_server(settings, transport=transport).http_app(path=MCP_PATH, stateless_http=True)
 
@@ -219,7 +235,8 @@ def _log_startup(settings: Settings, platform: PlatformSettings) -> None:
     )
     if platform.redirect_allowlist is None:
         logger.warning(
-            "MCP_ALLOWED_CLIENT_REDIRECT_URIS is unset: dynamic client registration accepts any redirect_uri"
+            "MCP_ALLOW_ANY_REDIRECT_URI=true and no MCP_ALLOWED_CLIENT_REDIRECT_URIS: "
+            "dynamic client registration accepts any redirect_uri"
         )
     if settings.browser_url == settings.zammad_url:
         logger.warning("ZAMMAD_PUBLIC_URL and ZAMMAD_URL are unset: links in tool results point at the internal URL")
