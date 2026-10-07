@@ -7,7 +7,9 @@ import pytest
 
 from zammad_mcp.confirmations import (
     KEY_PREFIX,
+    MAX_OUTSTANDING_PER_IDENTITY,
     ConfirmationError,
+    ConfirmationLimitError,
     Confirmations,
     MemoryConfirmationBackend,
     payload_digest,
@@ -87,7 +89,7 @@ async def test_unknown_token_is_refused(confirmations, token):
         await confirmations.consume(token, identity="id-1", action="send_email_reply", payload=PAYLOAD)
 
 
-async def test_tampered_record_is_refused(confirmations, backend):
+async def test_corrupted_digest_is_refused(confirmations, backend):
     token = await issue(confirmations)
     ((key, (raw, expires_at)),) = backend._values.items()
     record = {**json.loads(raw), "payload_sha256": payload_digest({"something": "else"})}
@@ -161,7 +163,7 @@ async def test_payload_is_only_kept_on_request(confirmations, backend):
 
 async def test_redeem_without_a_kept_payload_is_refused(confirmations):
     token = await confirmations.issue(identity="id-1", action="email_reply", payload=PAYLOAD)
-    with pytest.raises(ConfirmationError, match="integrity"):
+    with pytest.raises(ConfirmationError, match="corrupted"):
         await confirmations.redeem(token, identity="id-1", action="email_reply")
 
 
@@ -174,10 +176,10 @@ async def test_redeem_mismatch_is_refused_and_burns_the_token(confirmations, ide
         await confirmations.redeem(token, identity="id-1", action="email_reply")
 
 
-async def test_redeem_refuses_a_tampered_payload(confirmations, backend):
+async def test_redeem_detects_a_corrupted_payload(confirmations, backend):
     token = await issue_kept(confirmations)
     rewrite_record(backend, payload={**PAYLOAD, "to": ["attacker@example.com"]})
-    with pytest.raises(ConfirmationError, match="integrity"):
+    with pytest.raises(ConfirmationError, match="corrupted"):
         await confirmations.redeem(token, identity="id-1", action="email_reply")
 
 
@@ -192,3 +194,57 @@ async def test_non_ascii_identities_compare_safely(confirmations):
     token = await confirmations.issue(identity="ü-1", action="email_reply", payload=PAYLOAD, keep_payload=True)
     with pytest.raises(ConfirmationError, match="does not match"):
         await confirmations.redeem(token, identity="ü-2", action="email_reply")
+
+
+# --- bounds ---
+
+
+async def test_one_identity_is_capped_at_its_outstanding_confirmations(confirmations):
+    tokens = [await issue(confirmations) for _ in range(MAX_OUTSTANDING_PER_IDENTITY)]
+    with pytest.raises(ConfirmationLimitError, match=f"already have {MAX_OUTSTANDING_PER_IDENTITY} actions waiting"):
+        await issue(confirmations)
+    await confirmations.issue(identity="id-2", action="send_email_reply", payload=PAYLOAD)
+    await confirmations.consume(tokens[0], identity="id-1", action="send_email_reply", payload=PAYLOAD)
+    await issue(confirmations)
+
+
+async def test_expired_confirmations_free_their_slots(confirmations, clock):
+    for _ in range(MAX_OUTSTANDING_PER_IDENTITY):
+        await issue(confirmations)
+    clock.now += 601
+    await issue(confirmations)
+    assert set(confirmations._outstanding) == {"id-1"}
+
+
+async def test_a_failed_consume_still_frees_the_slot(backend, clock):
+    confirmations = Confirmations(backend, ttl_seconds=600, clock=clock, max_outstanding_per_identity=1)
+    token = await issue(confirmations)
+    with pytest.raises(ConfirmationError, match="does not match"):
+        await confirmations.consume(token, identity="id-1", action="other", payload=PAYLOAD)
+    await issue(confirmations)
+
+
+async def test_idle_identities_are_dropped(confirmations, clock):
+    await confirmations.issue(identity="id-2", action="a", payload=PAYLOAD)
+    clock.now += 601
+    await issue(confirmations)
+    assert set(confirmations._outstanding) == {"id-1"}
+
+
+async def test_memory_backend_refuses_past_its_byte_cap(clock):
+    backend = MemoryConfirmationBackend(clock=clock, max_bytes=10)
+    await backend.put("a", "12345", 60)
+    await backend.put("a", "123456789", 60)
+    with pytest.raises(ConfirmationLimitError, match="too many large actions"):
+        await backend.put("b", "12", 60)
+    clock.now += 61
+    await backend.put("b", "1234567890", 60)
+
+
+async def test_a_refused_put_releases_the_reservation(clock):
+    confirmations = Confirmations(
+        MemoryConfirmationBackend(clock=clock, max_bytes=10), clock=clock, max_outstanding_per_identity=1
+    )
+    with pytest.raises(ConfirmationLimitError, match="too many large actions"):
+        await issue(confirmations)
+    assert confirmations._outstanding == {}
