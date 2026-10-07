@@ -12,7 +12,7 @@ from tests.helpers import data, tools
 from zammad_mcp import server
 from zammad_mcp.client.errors import error_detail
 from zammad_mcp.config import Settings
-from zammad_mcp.confirmations import Confirmations
+from zammad_mcp.confirmations import MAX_OUTSTANDING_PER_IDENTITY, Confirmations
 from zammad_mcp.tools.macros import CONFIRMATION_STORE_DOWN, macro_payload
 
 MACRO_TOOLS = {"list_macros", "prepare_apply_macro", "apply_macro"}
@@ -189,11 +189,57 @@ async def test_mass_macro_refusal_names_the_tickets(macro_settings, zammad, body
     assert "True" not in applied
 
 
-async def test_mass_macro_server_error_is_not_retried(macro_settings, zammad):
+async def test_mass_macro_server_error_is_not_retried_and_may_have_applied(macro_settings, zammad):
     zammad.on("POST", "/tickets/mass_macro", status=503, json={"error": "busy"})
     _, applied = await prepare_then_apply(macro_settings, zammad, PREPARE)
-    assert applied == "Error: Zammad had a server error (HTTP 503); try again later"
+    assert applied == (
+        "Error: Zammad had a server error (HTTP 503); try again later; the macro may or may not have been "
+        "applied. Check the tickets before preparing it again"
+    )
     assert len(zammad.calls("POST", "/tickets/mass_macro")) == 1
+
+
+async def test_mass_macro_in_flight_failure_may_have_applied(macro_settings, zammad):
+    def time_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    zammad.on("POST", "/tickets/mass_macro", handler=time_out)
+    _, applied = await prepare_then_apply(macro_settings, zammad, PREPARE)
+    assert applied.startswith("Error: could not reach Zammad (ReadTimeout); the macro may or may not have been")
+    assert len(zammad.calls("POST", "/tickets/mass_macro")) == 1
+
+
+async def test_mass_macro_connect_failure_changed_nothing(macro_settings, zammad):
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    zammad.on("POST", "/tickets/mass_macro", handler=refuse)
+    _, applied = await prepare_then_apply(macro_settings, zammad, PREPARE)
+    assert applied == "Error: could not reach Zammad (ConnectError); nothing was changed, prepare the macro again"
+
+
+async def test_mass_macro_accepted_but_unreadable(macro_settings, zammad):
+    zammad.on("POST", "/tickets/mass_macro", handler=lambda _request: httpx.Response(200, content=b"<html>"))
+    _, applied = await prepare_then_apply(macro_settings, zammad, PREPARE)
+    assert applied == (
+        "Error: Zammad accepted the macro, so it was applied, but its answer could not be read; "
+        "check the tickets before preparing it again"
+    )
+
+
+async def test_mass_macro_other_errors_pass_through(macro_settings, zammad):
+    zammad.on("POST", "/tickets/mass_macro", status=403, json={"error": "Not authorized"})
+    _, applied = await prepare_then_apply(macro_settings, zammad, PREPARE)
+    assert applied.startswith("Error: permission denied (HTTP 403: Not authorized)")
+
+
+async def test_prepare_refuses_past_the_per_user_confirmation_cap(macro_settings, zammad):
+    async with Client(server.build_server(macro_settings, transport=zammad)) as client:
+        results = [
+            (await client.call_tool("prepare_apply_macro", PREPARE)).data
+            for _ in range(MAX_OUTSTANDING_PER_IDENTITY + 1)
+        ]
+    assert results[-1].startswith(f"Error: you already have {MAX_OUTSTANDING_PER_IDENTITY} actions waiting")
 
 
 async def test_ticket_list_is_bounded(macro_settings, zammad):

@@ -26,6 +26,7 @@ from pydantic import Field
 
 from zammad_mcp.client import ZammadError, to_tool_error
 from zammad_mcp.client.errors import UnprocessableError
+from zammad_mcp.client.http import accepted_but_unreadable, never_sent, outcome_unknown
 from zammad_mcp.client.models import Macro
 from zammad_mcp.confirmations import ConfirmationError
 from zammad_mcp.tiers import Tier
@@ -73,10 +74,23 @@ async def active_macro(session: ZammadSession, macro_id: int) -> Macro:
 
 
 def mass_macro_failure(error: ZammadError) -> str:
+    """Say whether the tickets changed: surely not, maybe, or yes with an unreadable answer."""
     if isinstance(error, UnprocessableError):
         return (
             f"Error: Zammad refused to apply the macro and changed nothing (HTTP 422: {error.detail}); "
             "the macro's group restriction may not cover a ticket, or you cannot change one of them"
+        )
+    if accepted_but_unreadable(error):
+        return (
+            "Error: Zammad accepted the macro, so it was applied, but its answer could not be read; "
+            "check the tickets before preparing it again"
+        )
+    if never_sent(error):
+        return f"{to_tool_error(error)}; nothing was changed, prepare the macro again"
+    if outcome_unknown(error):
+        return (
+            f"{to_tool_error(error)}; the macro may or may not have been applied. Check the tickets before "
+            "preparing it again"
         )
     return to_tool_error(error)
 
@@ -117,6 +131,8 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
         payload = macro_payload(macro_id, ticket_ids)
         try:
             token = await confirmations.issue(identity=session.credential.identity, action=ACTION, payload=payload)
+        except ConfirmationError as error:
+            return f"Error: {error}"
         except Exception:
             logger.warning("could not store a macro confirmation", exc_info=True)
             return CONFIRMATION_STORE_DOWN
