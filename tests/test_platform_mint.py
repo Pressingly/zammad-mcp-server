@@ -365,7 +365,6 @@ async def test_a_recheck_that_empties_the_ceiling_fails_closed(minter, zammad, c
 
 async def test_forbidden_limiter_allows_one_recheck_per_five_minutes(minter, zammad, clock):
     await minter.token_for(identity(AGENT))
-    clock.advance(1)
 
     assert await minter.note_forbidden(identity(AGENT)) is True
     assert await minter.note_forbidden(identity(AGENT)) is False
@@ -664,10 +663,7 @@ async def test_a_forbidden_marker_never_overwrites_a_concurrent_remint(minter, z
     cached = (await cache_for(store).load(identity(AGENT).key)).minted
     assert marked is True
     assert renewed.token == cached.token == "minted-2"
-
-    clock.advance(1)
     assert (await minter.token_for(identity(AGENT))).token == "minted-2"
-    assert len(zammad.gets()) == 2, "a marker no newer than the fresh mint needs no re-check"
 
 
 async def test_a_forbidden_marker_does_not_touch_the_cached_value(minter, store, clock):
@@ -732,19 +728,44 @@ async def test_audit_lines_record_every_token_decision(minter, zammad, clock, ca
 def test_cache_entry_recheck_rules():
     minted = MintedToken("t", frozenset({"ticket.agent"}), Tier.AGENT, "f", date(2026, 10, 16), 100.0)
 
-    assert CacheEntry(None, 500.0).due_for_recheck(200.0) is False
-    assert CacheEntry(minted, None).due_for_recheck(200.0) is False
-    assert CacheEntry(minted, 100.0).due_for_recheck(200.0) is False
-    assert CacheEntry(minted, 150.0).due_for_recheck(200.0) is True
+    assert CacheEntry(None, recheck_flagged=True).due_for_recheck(200.0) is False
+    assert CacheEntry(minted).due_for_recheck(200.0) is False
+    assert CacheEntry(minted, recheck_flagged=True).due_for_recheck(200.0) is True
+    assert CacheEntry(minted).due_for_recheck(100.0 + RECHECK_INTERVAL_SECONDS) is True
 
 
-async def test_an_unreadable_marker_is_ignored(minter, store, zammad):
+async def test_the_due_flag_needs_no_clock_agreement(minter, zammad, store, clock):
     await minter.token_for(identity(AGENT))
-    await store.set(cache_for(store).recheck_key(identity(AGENT).key), "not-a-time", 60)
+    await minter.note_forbidden(identity(AGENT))
+    clock.advance(-3600)
 
+    await minter.token_for(identity(AGENT))
+    await minter.token_for(identity(AGENT))
+
+    assert len(zammad.gets()) == 2
+    assert await store.get(cache_for(store).due_key(identity(AGENT).key)) is None
+
+
+async def test_a_mint_clears_a_pending_flag(minter, zammad, store):
+    await minter.note_forbidden(identity(AGENT))
+
+    await minter.token_for(identity(AGENT))
     await minter.token_for(identity(AGENT))
 
     assert len(zammad.gets()) == 1
+    assert await store.get(cache_for(store).due_key(identity(AGENT).key)) is None
+    assert await store.get(cache_for(store).limit_key(identity(AGENT).key)) == "1"
+
+
+async def test_a_flag_that_cannot_be_cleared_costs_one_more_recheck(zammad, clock):
+    class StuckFlags(MemoryKeyValue):
+        async def delete(self, key):
+            raise ConnectionError("valkey down")
+
+    minter = make_minter(zammad, StuckFlags(clock), clock)
+    await minter.note_forbidden(identity(AGENT))
+
+    assert (await minter.token_for(identity(AGENT))).token == "minted-1"
 
 
 async def test_another_users_synthetic_address_is_refused(minter, zammad):

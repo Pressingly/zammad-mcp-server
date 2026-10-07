@@ -64,9 +64,10 @@ email capture off, mpass does not stamp tokens, so real addresses in `DEFAULT_EM
   install), so a token asked for `today + 9 days` lives about 8 days. The cache keeps it for 6 days and treats it as
   stale from one day before 00:00 UTC of the expiry date, which stays ahead of the real expiry in any time zone.
 - Downgrades apply at once, because Zammad intersects the role and the token on every check.
-- Upgrades are found by a re-check every 4 hours, and after a role-gated 403. The 403 only writes a re-check
-  marker (`SET NX EX`, so at most once per 5 minutes per identity) and never rewrites the cached token, so it cannot
-  race a concurrent re-mint; a token checked after the marker was set needs no re-check. A changed ceiling mints a
+- Upgrades are found by a re-check every 4 hours, and after a role-gated 403. The 403 only sets a "due" flag,
+  behind a `SET NX EX` limiter (at most once per 5 minutes per identity), and never rewrites the cached token, so it
+  cannot race a concurrent re-mint. The next re-check or mint clears the flag; no timestamps are compared, so
+  replicas with skewed clocks agree. A changed ceiling mints a
   new token.
 - A 401 (expired or revoked token) drops the cache entry, mints once and retries the request once.
 - A denial while re-checking (corporate gate, customer token access withdrawn) drops the cache entry and fails the
@@ -106,7 +107,8 @@ Valkey database holds:
 |---|---|
 | FastMCP collections | OAuth state (clients, transactions, codes, upstream tokens, JTI mappings), Fernet-encrypted |
 | `zammad-mcp:token:v1:<namespace>:*` | Minted tokens, Fernet-encrypted |
-| `zammad-mcp:recheck:v1:<namespace>:*` | 403 re-check markers, 5-minute TTL |
+| `zammad-mcp:recheck-limit:v1:<namespace>:*` | 403 re-check limiter, 5-minute TTL |
+| `zammad-mcp:recheck-due:v1:<namespace>:*` | 403 re-check flags, cleared by the next re-check or mint |
 | `zammad-mcp:confirm:v1:*` | Two-step confirmations, Fernet-encrypted (they can hold a whole email) |
 | `zammad-mcp:confirm-bytes:v1:<namespace>:*` | Confirmation sizes, expiries and running total, for the byte cap |
 

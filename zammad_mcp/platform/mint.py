@@ -27,10 +27,10 @@ per user and sends at most one new-device email.
 The result is cached Fernet-encrypted under the deployment namespace and
 ``sha256(identity)`` for six days and treated as stale within a day of
 expiry. It is re-checked every four hours, and after a permission-gated 403:
-the 403 only sets a re-check marker (``SET NX EX``, so at most once per five
-minutes per identity) and never rewrites the cached token, so it cannot race
-a concurrent re-mint. A changed ceiling re-mints. A 401 drops it and
-re-mints. Every mint, re-check and denial writes one ``zammad_mcp.audit``
+the 403 only sets a "due" flag behind a ``SET NX EX`` limiter (at most once
+per five minutes per identity) and never rewrites the cached token, so it
+cannot race a concurrent re-mint; the next re-check or mint clears the flag.
+A changed ceiling re-mints. A 401 drops it and re-mints. Every mint, re-check and denial writes one ``zammad_mcp.audit``
 line, without the token or the email.
 
 Synthetic identities are refused before any request, because the first
@@ -85,7 +85,8 @@ STALE_MARGIN = timedelta(days=1)
 RECHECK_INTERVAL_SECONDS = 4 * 3600
 FORBIDDEN_RECHECK_INTERVAL_SECONDS = 5 * 60
 CACHE_KEY_PREFIX = "zammad-mcp:token:v1:"
-RECHECK_KEY_PREFIX = "zammad-mcp:recheck:v1:"
+RECHECK_LIMIT_KEY_PREFIX = "zammad-mcp:recheck-limit:v1:"
+RECHECK_DUE_KEY_PREFIX = "zammad-mcp:recheck-due:v1:"
 CACHE_SALT = "zammad-mcp-token-cache"
 SESSION_COOKIE_PREFIX = "_zammad_session_"
 SIGNOUT_PATH = "/signout"
@@ -193,25 +194,23 @@ def token_expiry(now: float) -> date:
 @dataclass(frozen=True)
 class CacheEntry:
     minted: MintedToken | None
-    recheck_requested_at: float | None
+    recheck_flagged: bool = False
 
     def due_for_recheck(self, now: float) -> bool:
-        """Four hours since the last check, or a 403 asked for a re-check after it."""
+        """Four hours since the last check, or a 403 flagged a re-check that has not run yet."""
         if self.minted is None:
             return False
-        requested = self.recheck_requested_at
-        return self.minted.due_for_recheck(now) or (requested is not None and requested > self.minted.checked_at)
-
-
-def _parse_timestamp(raw: str | None) -> float | None:
-    try:
-        return float(raw) if raw else None
-    except ValueError:
-        return None
+        return self.recheck_flagged or self.minted.due_for_recheck(now)
 
 
 class TokenCache:
-    """Minted tokens and re-check markers, under one deployment's namespace."""
+    """Minted tokens and their re-check flags, under one deployment's namespace.
+
+    A 403 sets two keys: a limiter (``SET NX EX 300``) so it fires at most once
+    per five minutes, and a "due" flag that stays until a re-check or mint
+    clears it. Neither carries a timestamp, so replicas with skewed clocks
+    agree.
+    """
 
     def __init__(self, store: KeyValue, fernet: Fernet, *, namespace: str = DEFAULT_NAMESPACE) -> None:
         self._store = store
@@ -221,15 +220,18 @@ class TokenCache:
     def token_key(self, identity_key: str) -> str:
         return f"{CACHE_KEY_PREFIX}{self._namespace}:{identity_key}"
 
-    def recheck_key(self, identity_key: str) -> str:
-        return f"{RECHECK_KEY_PREFIX}{self._namespace}:{identity_key}"
+    def limit_key(self, identity_key: str) -> str:
+        return f"{RECHECK_LIMIT_KEY_PREFIX}{self._namespace}:{identity_key}"
+
+    def due_key(self, identity_key: str) -> str:
+        return f"{RECHECK_DUE_KEY_PREFIX}{self._namespace}:{identity_key}"
 
     async def load(self, identity_key: str) -> CacheEntry:
         try:
-            raw, marker = await self._store.get_many([self.token_key(identity_key), self.recheck_key(identity_key)])
+            raw, due = await self._store.get_many([self.token_key(identity_key), self.due_key(identity_key)])
         except Exception as exc:
             raise TokenCacheError("the Zammad token cache is unavailable; try again shortly") from exc
-        return CacheEntry(self._decode(raw), _parse_timestamp(marker))
+        return CacheEntry(self._decode(raw), recheck_flagged=due is not None)
 
     def _decode(self, raw: str | None) -> MintedToken | None:
         if not raw:
@@ -253,14 +255,24 @@ class TokenCache:
         except Exception:
             logger.warning("could not drop a token cache entry", exc_info=True)
 
-    async def request_recheck(self, identity_key: str, now: float) -> bool:
-        """Mark the token for a re-check; false while an earlier marker is still within its five minutes."""
+    async def request_recheck(self, identity_key: str) -> bool:
+        """Flag the token for a re-check; false while the limiter from an earlier 403 is still running."""
         try:
-            return await self._store.set_if_absent(
-                self.recheck_key(identity_key), repr(now), FORBIDDEN_RECHECK_INTERVAL_SECONDS
-            )
+            if not await self._store.set_if_absent(
+                self.limit_key(identity_key), "1", FORBIDDEN_RECHECK_INTERVAL_SECONDS
+            ):
+                return False
+            await self._store.set(self.due_key(identity_key), "1", CACHE_TTL_SECONDS)
         except Exception as exc:
             raise TokenCacheError("the Zammad token cache is unavailable; try again shortly") from exc
+        return True
+
+    async def clear_recheck(self, identity_key: str) -> None:
+        """Best effort: a flag left behind only costs one more re-check."""
+        try:
+            await self._store.delete(self.due_key(identity_key))
+        except Exception:
+            logger.warning("could not clear a re-check flag", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -560,7 +572,7 @@ class TokenMinter:
 
     async def note_forbidden(self, identity: Identity) -> bool:
         """After a role-gated 403: ask for a re-check, at most once per five minutes; the token is left alone."""
-        requested = await self._cache.request_recheck(identity.key, self._clock())
+        requested = await self._cache.request_recheck(identity.key)
         if requested:
             _audit("recheck_requested", identity, reason="forbidden")
         return requested
@@ -586,6 +598,7 @@ class TokenMinter:
             if ceiling and ceiling_fingerprint(ceiling) == cached.ceiling_fingerprint:
                 refreshed = replace(cached, checked_at=self._clock())
                 await self._cache.put(identity.key, refreshed, self._clock())
+                await self._cache.clear_recheck(identity.key)
                 _audit("recheck_unchanged", identity, refreshed)
                 return refreshed
             return await self._mint_with(session, grant, identity, reason="permissions_changed")
@@ -617,6 +630,7 @@ class TokenMinter:
             name=name,
         )
         await self._cache.put(identity.key, minted, now)
+        await self._cache.clear_recheck(identity.key)
         _audit("minted", identity, minted, reason=reason)
         await session.delete_expired(grant, now)
         return minted

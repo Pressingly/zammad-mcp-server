@@ -161,12 +161,11 @@ async def test_a_role_denial_arms_one_recheck(zammad, clock):
     credentials, store = provider_for(zammad, clock, identity(CUSTOMER))
     client = ZammadClient(f"{INTERNAL}/api/v1", transport=zammad, on_rejected=credentials.on_rejected)
     token = (await credentials.resolve()).token
-    clock.advance(1)
 
     with pytest.raises(PermissionDenied):
         await client.get("/users/search", token=token)
 
-    assert await store.get(cache_for(store).recheck_key(identity(CUSTOMER).key)) is not None
+    assert await store.get(cache_for(store).due_key(identity(CUSTOMER).key)) is not None
     await credentials.resolve()
     assert len(zammad.gets()) == 2
 
@@ -185,7 +184,7 @@ async def test_gateway_and_other_403s_never_arm_a_recheck(zammad, clock):
     credentials, store = provider_for(zammad, clock, identity(AGENT))
 
     assert await credentials.on_rejected(GatewayDeniedError(403, "access_denied"), "t") is None
-    assert await store.get(cache_for(store).recheck_key(identity(AGENT).key)) is None
+    assert await store.get(cache_for(store).due_key(identity(AGENT).key)) is None
     assert is_role_denial(PermissionDenied(403, "Not authorized"))
     assert not is_role_denial(GatewayDeniedError(403, "access_denied"))
     assert not is_role_denial(ZammadAPIError(500, "x"))
