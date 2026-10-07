@@ -64,6 +64,7 @@ class Ticket(ZammadModel):
     customer_id: int | None = None
     owner_id: int | None = None
     organization_id: int | None = None
+    group_id: int | None = None
     article_count: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -79,6 +80,7 @@ class Article(ZammadModel):
     from_: str | None = Field(default=None, alias="from")
     to: str | None = None
     cc: str | None = None
+    reply_to: str | None = None
     subject: str | None = None
     body: str | None = None
     content_type: str | None = None
@@ -151,3 +153,16 @@ class KnowledgeBaseAnswerTranslation(ZammadModel):
 class KnowledgeBaseAnswerContent(ZammadModel):
     id: int
     body: str | None = None
+
+
+class Group(ZammadModel):
+    id: int
+    name: str | None = None
+    email_address_id: int | None = None
+
+
+class EmailAddress(ZammadModel):
+    id: int
+    email: str | None = None
+    active: bool | None = None
+    channel_id: int | None = None

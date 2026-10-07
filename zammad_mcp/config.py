@@ -9,13 +9,26 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from zammad_mcp.env_flags import env_flag
 
 DEFAULT_HTTP_PORT = 8214
 DEFAULT_CONFIRM_TTL_SECONDS = 600
-TOOL_MODULES = ("reference", "tickets", "articles", "attachments", "search", "users", "organizations", "tags", "kb")
+TOOL_MODULES = (
+    "reference",
+    "tickets",
+    "articles",
+    "attachments",
+    "search",
+    "users",
+    "organizations",
+    "tags",
+    "kb",
+    "email_replies",
+)
+DEFAULT_OFF_MODULES = frozenset({"email_replies"})
+DEFAULT_ENABLED_MODULES = frozenset(TOOL_MODULES) - DEFAULT_OFF_MODULES
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -35,8 +48,9 @@ class Settings:
     read_only: bool = False
     filter_tools_by_role: bool = False
     confirm_ttl_seconds: int = DEFAULT_CONFIRM_TTL_SECONDS
-    enabled_modules: frozenset[str] = field(default_factory=lambda: frozenset(TOOL_MODULES))
+    enabled_modules: frozenset[str] = DEFAULT_ENABLED_MODULES
     http_shared_token_route: bool = False
+    email_allow_any_recipient: bool = False
 
     @property
     def api_base_url(self) -> str:
@@ -79,9 +93,12 @@ class Settings:
             filter_tools_by_role=env_flag("ZAMMAD_FILTER_TOOLS_BY_ROLE", environ=env),
             confirm_ttl_seconds=_positive_int(env, "ZAMMAD_CONFIRM_TTL_SECONDS", DEFAULT_CONFIRM_TTL_SECONDS),
             enabled_modules=frozenset(
-                module for module in TOOL_MODULES if env_flag(module_flag(module), default=True, environ=env)
+                module
+                for module in TOOL_MODULES
+                if env_flag(module_flag(module), default=module in DEFAULT_ENABLED_MODULES, environ=env)
             ),
             http_shared_token_route=env_flag("ZAMMAD_HTTP_SHARED_TOKEN_ROUTE", environ=env),
+            email_allow_any_recipient=env_flag("ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT", environ=env),
         )
 
 

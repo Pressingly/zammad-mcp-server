@@ -11,7 +11,7 @@ from fastmcp import Client
 
 from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
 from tests.helpers import call, data, tools, unframed
-from zammad_mcp.config import TOOL_MODULES
+from zammad_mcp.config import DEFAULT_ENABLED_MODULES
 from zammad_mcp.server import build_server
 from zammad_mcp.tools.tickets import _FILTER_FIELDS, ticket_condition
 
@@ -86,7 +86,7 @@ async def test_read_only_drops_exactly_the_writes(settings, fake):
     ],
 )
 async def test_module_flag_unregisters_the_module(settings, fake, module, gone):
-    enabled = frozenset(TOOL_MODULES) - {module}
+    enabled = DEFAULT_ENABLED_MODULES - {module}
     names = set(await tools(dataclasses.replace(settings, enabled_modules=enabled), fake))
     assert names == ALL_TOOLS - gone
     assert "get_me" in names

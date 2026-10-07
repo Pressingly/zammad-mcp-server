@@ -100,6 +100,8 @@ READ = ToolSpec(read_only=True, destructive=False, idempotent=True)
 CREATE = ToolSpec(read_only=False, destructive=False, idempotent=False)
 ADD = ToolSpec(read_only=False, destructive=False, idempotent=True)
 OVERWRITE = ToolSpec(read_only=False, destructive=True, idempotent=True)
+PREPARE = ToolSpec(read_only=True, destructive=False, idempotent=False)
+SEND = ToolSpec(read_only=False, destructive=True, idempotent=False)
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,7 @@ class ToolContext:
     tier_check: AuthCheck
     confirmations: Confirmations
     read_only: bool = False
+    email_allow_any_recipient: bool = False
 
     async def session(self) -> ZammadSession:
         return ZammadSession(self.client, await self.credentials.resolve())
