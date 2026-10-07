@@ -166,3 +166,12 @@ class EmailAddress(ZammadModel):
     email: str | None = None
     active: bool | None = None
     channel_id: int | None = None
+
+
+class Macro(ZammadModel):
+    id: int
+    name: str | None = None
+    active: bool | None = None
+    note: str | None = None
+    group_ids: list[int] = Field(default_factory=list)
+    perform: dict[str, Any] = Field(default_factory=dict)

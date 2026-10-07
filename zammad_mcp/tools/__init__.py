@@ -6,7 +6,8 @@ returns an ``Error: ...`` string instead of raising.
 
 A module whose ``ZAMMAD_ENABLE_<MODULE>`` flag is false never registers, and
 ``ZAMMAD_READ_ONLY`` keeps every write tool unregistered. ``get_me`` is
-always on. Every module has one flag; ``email_replies`` is off by default.
+always on. Every module has one flag; ``email_replies`` and ``macros`` are off
+by default.
 The Phase 6 follow-ups each add a module and a flag.
 """
 
@@ -23,6 +24,7 @@ from zammad_mcp.tools import (
     attachments,
     email,
     kb,
+    macros,
     me,
     organizations,
     reference,
@@ -46,6 +48,7 @@ MODULES: dict[str, ModuleType] = {
     "tags": tags,
     "kb": kb,
     "email_replies": email,
+    "macros": macros,
 }
 
 

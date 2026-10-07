@@ -26,8 +26,9 @@ TOOL_MODULES = (
     "tags",
     "kb",
     "email_replies",
+    "macros",
 )
-DEFAULT_OFF_MODULES = frozenset({"email_replies"})
+DEFAULT_OFF_MODULES = frozenset({"email_replies", "macros"})
 DEFAULT_ENABLED_MODULES = frozenset(TOOL_MODULES) - DEFAULT_OFF_MODULES
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0

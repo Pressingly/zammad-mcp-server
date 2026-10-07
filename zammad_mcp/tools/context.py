@@ -101,7 +101,7 @@ CREATE = ToolSpec(read_only=False, destructive=False, idempotent=False)
 ADD = ToolSpec(read_only=False, destructive=False, idempotent=True)
 OVERWRITE = ToolSpec(read_only=False, destructive=True, idempotent=True)
 PREPARE = ToolSpec(read_only=True, destructive=False, idempotent=False)
-SEND = ToolSpec(read_only=False, destructive=True, idempotent=False)
+IRREVERSIBLE = ToolSpec(read_only=False, destructive=True, idempotent=False)
 
 
 @dataclass(frozen=True)

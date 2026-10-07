@@ -122,7 +122,26 @@ def error_detail(response: httpx.Response) -> str:
         return fallback
     if not isinstance(body, dict):
         return fallback
-    return str(body.get("error_human") or body.get("error") or fallback)
+    message = _error_message(body) or fallback
+    tickets = _blocking_ticket_ids(body)
+    return f"{message} (tickets: {', '.join(tickets)})" if tickets else message
+
+
+def _error_message(body: dict) -> str | None:
+    """``error_human`` or ``error``; Zammad's bulk endpoints send ``"error": true``, which says nothing."""
+    for key in ("error_human", "error"):
+        value = body.get(key)
+        if value and not isinstance(value, bool):
+            return str(value)
+    return None
+
+
+def _blocking_ticket_ids(body: dict) -> list[str]:
+    """The tickets a bulk ticket call (``/tickets/mass_*``) names as the reason it failed."""
+    ids = body.get("blocking_tickets")
+    if not isinstance(ids, list):
+        ids = [body.get("ticket_id")]
+    return [str(item) for item in ids if isinstance(item, int) and not isinstance(item, bool)]
 
 
 def to_tool_error(error: ZammadError) -> str:

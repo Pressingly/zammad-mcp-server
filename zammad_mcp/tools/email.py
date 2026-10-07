@@ -41,7 +41,7 @@ from zammad_mcp.client.http import PRE_SEND_ERRORS
 from zammad_mcp.client.models import Article, EmailAddress, Group, Ticket, User
 from zammad_mcp.confirmations import ConfirmationError
 from zammad_mcp.tiers import Tier
-from zammad_mcp.tools.context import PREPARE, SEND, ToolContext, ZammadSession, as_list, tier_error
+from zammad_mcp.tools.context import IRREVERSIBLE, PREPARE, ToolContext, ZammadSession, as_list, tier_error
 
 MODULE = "email_replies"
 ACTION = "email_reply"
@@ -292,7 +292,7 @@ def register(mcp: FastMCP, context: ToolContext) -> None:
             ),
         }
 
-    @mcp.tool(**context.tool("Send email reply", SEND, module=MODULE, tier=Tier.AGENT))
+    @mcp.tool(**context.tool("Send email reply", IRREVERSIBLE, module=MODULE, tier=Tier.AGENT))
     async def send_email_reply(
         confirmation_token: Annotated[str, Field(min_length=1, max_length=200)],
         to: Annotated[Recipients, Field(min_length=1, description="The preview's to, unchanged")],

@@ -11,7 +11,7 @@ from fastmcp import Client
 
 from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
 from tests.helpers import call, data, tools, unframed
-from zammad_mcp.config import DEFAULT_ENABLED_MODULES
+from zammad_mcp.config import DEFAULT_ENABLED_MODULES, TOOL_MODULES
 from zammad_mcp.server import build_server
 from zammad_mcp.tools.tickets import _FILTER_FIELDS, ticket_condition
 
@@ -69,6 +69,22 @@ async def test_every_tool_has_annotations_tier_and_module_tags(settings, fake):
         tags = set((tool.meta or {}).get("fastmcp", {}).get("tags", []))
         assert {"tier:none", "tier:customer", "tier:agent"} & tags, f"{name} has no tier tag"
         assert any(tag.startswith("module:") for tag in tags), f"{name} has no module tag"
+
+
+OPT_IN_TOOLS = {"prepare_email_reply", "send_email_reply", "list_macros", "prepare_apply_macro", "apply_macro"}
+CONFIRMED_WRITES = {"prepare_email_reply", "send_email_reply", "prepare_apply_macro", "apply_macro"}
+
+
+async def test_every_module_on_gives_every_tool_all_four_annotations(settings, fake):
+    everything = dataclasses.replace(settings, enabled_modules=frozenset(TOOL_MODULES))
+    listed = await tools(everything, fake)
+    assert set(listed) == ALL_TOOLS | OPT_IN_TOOLS
+    for name, tool in listed.items():
+        hints = tool.annotations.model_dump()
+        assert all(isinstance(hints.get(hint), bool) for hint in ANNOTATION_HINTS), name
+        assert any(tag.startswith("tier:") for tag in tool.meta["fastmcp"]["tags"]), name
+    read_only = set(await tools(dataclasses.replace(everything, read_only=True), fake))
+    assert read_only == (ALL_TOOLS | OPT_IN_TOOLS) - WRITE_TOOLS - CONFIRMED_WRITES
 
 
 async def test_read_only_drops_exactly_the_writes(settings, fake):
