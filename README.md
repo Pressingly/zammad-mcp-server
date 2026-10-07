@@ -157,7 +157,7 @@ Email replies:
 
   Internal notes and messages from anyone else, such as an outsider who emailed in with the ticket number, add no
   participants. Unless `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`, every recipient must be a participant.
-- No recipient may be one of the Zammad's own email addresses (any group's), with or without
+- No recipient may be one of Zammad's own email addresses (any group's), with or without
   `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT`.
 - The preview lists a `recipient_warnings` entry for every recipient who is not the ticket's customer.
 - Limits: at most 10 recipients (to and cc together), a body of 1,000,000 characters, and 10 MB of attachment

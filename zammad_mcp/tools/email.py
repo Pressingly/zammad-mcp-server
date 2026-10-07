@@ -23,7 +23,7 @@ action here that leaves Zammad, so it takes two calls:
 Articles from anyone else, such as an outsider who emailed the ticket
 number, add nothing, so they cannot widen the list. Unless
 ``ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`` every recipient must be a
-participant. None may ever be one of the Zammad's own email addresses, and the
+participant. None may ever be one of Zammad's own email addresses, and the
 preview carries a warning for every recipient who is not the ticket's
 customer. At most 10 recipients, a 1,000,000-character body and 10 MB of
 attachment content (decoded).
@@ -131,7 +131,7 @@ def participants(articles: list[Article], ticket: Ticket, customer: str | None) 
 
 
 def default_recipients(customer: str | None, system: frozenset[str]) -> list[str]:
-    """The ticket customer's email, unless it is missing or one of the Zammad's own addresses."""
+    """The ticket customer's email, unless it is missing or one of Zammad's own addresses."""
     return [customer] if customer and customer not in system else []
 
 
