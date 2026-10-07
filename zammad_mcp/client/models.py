@@ -86,6 +86,8 @@ class Article(ZammadModel):
     content_type: str | None = None
     internal: bool | None = None
     created_by: str | None = None
+    created_by_id: int | None = None
+    origin_by_id: int | None = None
     created_at: str | None = None
     attachments: list[Attachment] = Field(default_factory=list)
 

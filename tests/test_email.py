@@ -17,12 +17,16 @@ from tests.conftest import FakeZammad, admin_only_fake, unknown_role_fake
 from tests.helpers import rpc, tool_text, tools
 from zammad_mcp import server
 from zammad_mcp.config import Settings
-from zammad_mcp.confirmations import Confirmations, MemoryConfirmationBackend
+from zammad_mcp.confirmations import MAX_OUTSTANDING_PER_IDENTITY, Confirmations, MemoryConfirmationBackend
 from zammad_mcp.credentials.base import token_identity
 from zammad_mcp.tools import email as email_tools
 from zammad_mcp.tools.email import (
     CONFIRMATION_STORE_DOWN,
+    MAX_ATTACHMENT_DATA_CHARS,
+    MAX_EMAIL_BODY_CHARS,
     MAX_RECIPIENTS,
+    SENT_UNREADABLE,
+    decoded_size,
     normalize_recipients,
     parse_addresses,
 )
@@ -31,47 +35,86 @@ EMAIL_TOOLS = {"prepare_email_reply", "send_email_reply"}
 TICKET = {"id": 4, "number": "20004", "title": "Printer on fire", "group_id": 1, "group": "Users", "customer_id": 9}
 GROUP = {"id": 1, "name": "Users", "email_address_id": 3}
 SENDER = {"id": 3, "email": "Support@Example.com", "active": True, "channel_id": 5}
-ARTICLES = [
-    {"id": 1, "ticket_id": 4, "sender": "Customer", "type": "email", "from": "Cara <cara@example.com>"},
-    {
-        "id": 2,
-        "ticket_id": 4,
-        "sender": "Agent",
-        "type": "email",
-        "from": "Support <support@example.com>",
-        "to": "cara@example.com",
-        "cc": "Boss <boss@example.com>",
-    },
-    {
-        "id": 3,
-        "ticket_id": 4,
-        "sender": "Customer",
-        "type": "email",
-        "from": "Cara <cara@example.com>",
-        "reply_to": "cara-replies@example.com",
-        "cc": "Colleague <colleague@example.com>, support@example.com",
-    },
-    {"id": 0, "ticket_id": 4, "sender": "Customer", "type": "web", "from": "Old Cara <old-cara@example.com>"},
-]
+OTHER_GROUP_SENDER = {"id": 4, "email": "Billing@Example.com", "active": True, "channel_id": 6}
+CUSTOMER_ARTICLE = {
+    "id": 1,
+    "ticket_id": 4,
+    "sender": "Customer",
+    "type": "email",
+    "internal": False,
+    "created_by_id": 9,
+    "from": "Cara <cara@example.com>",
+    "to": "support@example.com",
+    "reply_to": "cara-replies@example.com",
+    "cc": "Colleague <colleague@example.com>",
+}
+AGENT_ARTICLE = {
+    "id": 2,
+    "ticket_id": 4,
+    "sender": "Agent",
+    "type": "email",
+    "internal": False,
+    "created_by_id": 7,
+    "from": "Support <support@example.com>",
+    "to": "cara@example.com",
+    "cc": "Boss <boss@example.com>",
+}
+INTERNAL_NOTE = {
+    "id": 3,
+    "ticket_id": 4,
+    "sender": "Agent",
+    "type": "note",
+    "internal": True,
+    "created_by_id": 7,
+    "to": "secret-partner@example.com",
+}
+OUTSIDER_FOLLOW_UP = {
+    "id": 5,
+    "ticket_id": 4,
+    "sender": "Customer",
+    "type": "email",
+    "internal": False,
+    "created_by_id": 66,
+    "from": "Mallory <mallory@evil.test>",
+    "to": "support@example.com",
+    "reply_to": "drop@evil.test",
+    "cc": "accomplice@evil.test",
+}
+SYSTEM_NOTICE = {
+    "id": 6,
+    "ticket_id": 4,
+    "sender": "System",
+    "type": "email",
+    "internal": False,
+    "to": "notify-list@example.com",
+}
+ARTICLES = [CUSTOMER_ARTICLE, AGENT_ARTICLE, INTERNAL_NOTE, OUTSIDER_FOLLOW_UP, SYSTEM_NOTICE]
 CREATED = {"id": 50, "ticket_id": 4, "type": "email", "sender": "Agent", "internal": False}
 PREPARED = {"ticket_id": 4, "subject": "Re: printer", "body": "We are on it. SECRET-BODY-TEXT"}
+STRAY_SEND = {"confirmation_token": "t", "to": ["a@b.test"], "subject": "s"}
+NOT_A_PARTICIPANT = (
+    "is not a participant of this ticket; replies can only go to the ticket's customer, addresses on the "
+    "customer's own messages, or addresses agents already wrote to on this ticket"
+)
 
 
 def mailbox(fake: FakeZammad, *, group: dict | None = None, sender: dict | None = None) -> FakeZammad:
     fake.on("GET", "/tickets/4", json=TICKET)
     fake.on("GET", "/groups/1", json=group or GROUP)
     fake.on("GET", "/email_addresses/3", json=sender or SENDER)
+    fake.on("GET", "/email_addresses", json=[SENDER, OTHER_GROUP_SENDER, "junk"])
     fake.on("GET", "/ticket_articles/by_ticket/4", json=ARTICLES)
     fake.on("GET", "/users/9", json={"id": 9, "email": "Cara@Example.com"})
     fake.on("POST", "/ticket_articles", status=201, json=CREATED)
     return fake
 
 
-STRAY_SEND = {"confirmation_token": "t", "to": ["a@b.test"], "subject": "s"}
-
-
-def with_email(settings: Settings) -> Settings:
-    return dataclasses.replace(settings, enabled_modules=settings.enabled_modules | {"email_replies"})
+def with_email(settings: Settings, *, allow_any: bool = False) -> Settings:
+    return dataclasses.replace(
+        settings,
+        enabled_modules=settings.enabled_modules | {"email_replies"},
+        email_allow_any_recipient=allow_any,
+    )
 
 
 @pytest.fixture
@@ -113,6 +156,11 @@ async def session(settings: Settings, fake: httpx.AsyncBaseTransport, *calls: tu
         return [(await client.call_tool(name, arguments)).data for name, arguments in calls]
 
 
+async def prepare(settings: Settings, fake: FakeZammad, **changes: Any) -> Any:
+    (result,) = await session(settings, fake, ("prepare_email_reply", {**PREPARED, **changes}))
+    return result
+
+
 def send_args(preview: dict[str, Any], **changes: Any) -> dict[str, Any]:
     return {
         "confirmation_token": preview["confirmation_token"],
@@ -122,11 +170,15 @@ def send_args(preview: dict[str, Any], **changes: Any) -> dict[str, Any]:
     }
 
 
-async def prepare_then_send(settings: Settings, fake: FakeZammad, prepare: dict[str, Any], **send_changes: Any):
+async def prepare_then_send(settings: Settings, fake: FakeZammad, prepared: dict[str, Any], **send_changes: Any):
     async with Client(server.build_server(settings, transport=fake)) as client:
-        preview = (await client.call_tool("prepare_email_reply", prepare)).data
+        preview = (await client.call_tool("prepare_email_reply", prepared)).data
         sent = (await client.call_tool("send_email_reply", send_args(preview, **send_changes))).data
     return preview, sent
+
+
+def audit_lines(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == "zammad_mcp.audit"]
 
 
 # --- registration ---
@@ -139,12 +191,20 @@ async def test_flag_off_by_default_means_the_tools_are_absent(settings, zammad):
 
 async def test_flag_on_registers_both_tools_with_their_annotations(email_settings, zammad):
     listed = await tools(email_settings, zammad)
-    prepare, send = listed["prepare_email_reply"], listed["send_email_reply"]
+    prepare_tool, send_tool = listed["prepare_email_reply"], listed["send_email_reply"]
     hints = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
-    assert tuple(getattr(prepare.annotations, hint) for hint in hints) == (True, False, False, True)
-    assert tuple(getattr(send.annotations, hint) for hint in hints) == (False, True, False, True)
-    for tool in (prepare, send):
+    assert tuple(getattr(prepare_tool.annotations, hint) for hint in hints) == (True, False, False, True)
+    assert tuple(getattr(send_tool.annotations, hint) for hint in hints) == (False, True, False, True)
+    for tool in (prepare_tool, send_tool):
         assert {"tier:agent", "module:email_replies"} <= set(tool.meta["fastmcp"]["tags"])
+
+
+async def test_body_and_attachment_data_are_bounded_in_the_schema(email_settings, zammad):
+    schema = (await tools(email_settings, zammad))["prepare_email_reply"].inputSchema
+    assert schema["properties"]["body"]["maxLength"] == MAX_EMAIL_BODY_CHARS == 1_000_000
+    attachment = schema["properties"]["attachments"]["anyOf"][0]["items"]
+    assert attachment["properties"]["data"]["maxLength"] == MAX_ATTACHMENT_DATA_CHARS
+    assert MAX_ATTACHMENT_DATA_CHARS == 4 * email_tools.MAX_ATTACHMENT_BYTES // 3 + 4
 
 
 async def test_read_only_mode_drops_the_email_tools(email_settings, zammad):
@@ -154,11 +214,12 @@ async def test_read_only_mode_drops_the_email_tools(email_settings, zammad):
 # --- happy path ---
 
 
-async def test_prepare_then_send_posts_one_email_article(email_settings, zammad, caplog):
+async def test_prepare_then_send_posts_one_email_article_to_the_customer(email_settings, zammad, caplog):
     caplog.set_level(logging.INFO, logger="zammad_mcp.audit")
     preview, sent = await prepare_then_send(email_settings, zammad, PREPARED)
-    assert preview["to"] == ["cara-replies@example.com"]
+    assert preview["to"] == ["cara@example.com"]
     assert preview["cc"] == []
+    assert preview["recipient_warnings"] == []
     assert preview["from"] == "support@example.com"
     assert preview["subject"] == "Re: printer"
     assert preview["expires_in_seconds"] == 600
@@ -176,13 +237,12 @@ async def test_prepare_then_send_posts_one_email_article(email_settings, zammad,
         "type": "email",
         "sender": "Agent",
         "internal": False,
-        "to": "cara-replies@example.com",
+        "to": "cara@example.com",
         "subject": "Re: printer",
         "body": "We are on it. SECRET-BODY-TEXT",
         "content_type": "text/plain",
     }
-    (record,) = [record for record in caplog.records if record.name == "zammad_mcp.audit"]
-    line = record.getMessage()
+    (line,) = audit_lines(caplog)
     assert f"identity={token_identity('secret-token')}" in line
     assert "ticket_id=4 article_id=50 recipients=1 attachments=0" in line
     assert "SECRET-BODY-TEXT" not in line
@@ -190,24 +250,27 @@ async def test_prepare_then_send_posts_one_email_article(email_settings, zammad,
 
 
 async def test_prepare_never_writes_to_zammad(email_settings, zammad):
-    await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
+    await prepare(email_settings, zammad)
     assert zammad.calls("POST", "/ticket_articles") == []
     assert {request.method for request in zammad.requests} == {"GET"}
 
 
-async def test_explicit_recipients_are_normalized_and_cc_is_deduplicated(email_settings, zammad):
-    prepare = {**PREPARED, "to": ["Cara <CARA@example.com>"], "cc": ["boss@example.com", "cara@example.com"]}
-    preview, sent = await prepare_then_send(email_settings, zammad, prepare)
+async def test_explicit_recipients_are_normalized_deduplicated_and_flagged(email_settings, zammad):
+    prepared = {**PREPARED, "to": ["Cara <CARA@example.com>"], "cc": ["boss@example.com", "cara@example.com"]}
+    preview, sent = await prepare_then_send(email_settings, zammad, prepared)
     assert (preview["to"], preview["cc"]) == (["cara@example.com"], ["boss@example.com"])
+    assert preview["recipient_warnings"] == [
+        "boss@example.com is not the ticket's customer; make sure the user means to send to it"
+    ]
     body = zammad.last_json("POST", "/ticket_articles")
     assert (body["to"], body["cc"]) == ("cara@example.com", "boss@example.com")
     assert sent["status"] == "queued"
 
 
 async def test_echoed_to_may_differ_in_case_and_order(email_settings, zammad):
-    prepare = {**PREPARED, "to": ["cara@example.com", "colleague@example.com"]}
+    prepared = {**PREPARED, "to": ["cara@example.com", "colleague@example.com"]}
     _, sent = await prepare_then_send(
-        email_settings, zammad, prepare, to=["COLLEAGUE@example.com", "Cara <cara@example.com>"]
+        email_settings, zammad, prepared, to=["COLLEAGUE@example.com", "Cara <cara@example.com>"]
     )
     assert sent["status"] == "queued"
 
@@ -221,41 +284,131 @@ async def test_attachments_are_previewed_and_posted(email_settings, zammad):
     assert posted == [{"filename": "note.txt", "data": data, "mime-type": "text/plain"}]
 
 
-# --- recipient allow-list ---
+# --- who counts as a participant ---
 
 
 @pytest.mark.parametrize(
-    "to",
-    [["attacker@evil.test"], ["cara@example.com", "attacker@evil.test"], ["support@example.com"]],
+    "address",
+    ["cara-replies@example.com", "colleague@example.com", "boss@example.com"],
+    ids=["customer-reply-to", "customer-cc", "agent-cc"],
 )
-async def test_recipients_outside_the_ticket_are_refused(email_settings, zammad, store, to):
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", {**PREPARED, "to": to}))
-    assert shaped.startswith("Error: ")
-    assert "not a participant of this ticket" in shaped
-    assert store.backends[0]._values == {}
+async def test_customer_and_agent_articles_add_participants(email_settings, zammad, address):
+    preview = await prepare(email_settings, zammad, to=[address])
+    assert preview["to"] == [address]
+    assert preview["recipient_warnings"] == [
+        f"{address} is not the ticket's customer; make sure the user means to send to it"
+    ]
 
 
-async def test_cc_outside_the_ticket_is_refused(email_settings, zammad):
-    prepare = {**PREPARED, "cc": ["attacker@evil.test"]}
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", prepare))
-    assert shaped == (
-        "Error: attacker@evil.test is not a participant of this ticket; replies can only go to the ticket's "
-        "customer or an address already on one of its articles"
+@pytest.mark.parametrize(
+    "address",
+    [
+        "mallory@evil.test",
+        "drop@evil.test",
+        "accomplice@evil.test",
+        "secret-partner@example.com",
+        "notify-list@example.com",
+    ],
+    ids=["outsider-from", "outsider-reply-to", "outsider-cc", "internal-note", "system-article"],
+)
+async def test_outsider_and_internal_articles_add_no_participants(email_settings, zammad, address):
+    shaped = await prepare(email_settings, zammad, to=[address])
+    assert shaped == f"Error: {address} {NOT_A_PARTICIPANT}"
+
+
+async def test_outsider_follow_up_does_not_become_the_default_recipient(email_settings, zammad):
+    zammad.on("GET", "/ticket_articles/by_ticket/4", json=[AGENT_ARTICLE, OUTSIDER_FOLLOW_UP])
+    preview = await prepare(email_settings, zammad)
+    assert preview["to"] == ["cara@example.com"]
+    assert preview["recipient_warnings"] == []
+
+
+async def test_outsider_cc_cannot_ride_along(email_settings, zammad):
+    shaped = await prepare(email_settings, zammad, cc=["accomplice@evil.test", "drop@evil.test"])
+    assert shaped == f"Error: accomplice@evil.test, drop@evil.test {NOT_A_PARTICIPANT.replace('is not', 'are not')}"
+
+
+@pytest.mark.parametrize(
+    "author",
+    [{"created_by_id": None, "origin_by_id": 9}, {"created_by_id": None, "from": "cara@example.com"}],
+    ids=["origin-by", "from-address"],
+)
+async def test_customer_article_is_recognised_without_the_author_id(email_settings, zammad, author):
+    article = {**CUSTOMER_ARTICLE, "created_by_id": 12, **author}
+    zammad.on("GET", "/ticket_articles/by_ticket/4", json=[article])
+    assert (await prepare(email_settings, zammad, to=["cara-replies@example.com"]))["to"] == [
+        "cara-replies@example.com"
+    ]
+
+
+async def test_customer_named_reply_to_on_another_customer_article_does_not_count(email_settings, zammad):
+    impostor = {**CUSTOMER_ARTICLE, "created_by_id": 66, "from": "cara.lookalike@example.org"}
+    zammad.on("GET", "/ticket_articles/by_ticket/4", json=[impostor])
+    shaped = await prepare(email_settings, zammad, to=["cara-replies@example.com"])
+    assert shaped == f"Error: cara-replies@example.com {NOT_A_PARTICIPANT}"
+
+
+async def test_allow_any_recipient_lifts_the_participant_check(settings, zammad):
+    preview, sent = await prepare_then_send(
+        with_email(settings, allow_any=True), zammad, {**PREPARED, "to": ["partner@elsewhere.test"]}
     )
-
-
-async def test_allow_any_recipient_lifts_the_participant_check(email_settings, zammad):
-    allow_any = dataclasses.replace(email_settings, email_allow_any_recipient=True)
-    preview, sent = await prepare_then_send(allow_any, zammad, {**PREPARED, "to": ["partner@elsewhere.test"]})
     assert preview["to"] == ["partner@elsewhere.test"]
+    assert preview["recipient_warnings"] == [
+        "partner@elsewhere.test is not the ticket's customer; make sure the user means to send to it"
+    ]
     assert sent["status"] == "queued"
 
 
-async def test_more_than_ten_recipients_in_total_are_refused(email_settings, zammad):
-    allow_any = dataclasses.replace(email_settings, email_allow_any_recipient=True)
+# --- Zammad's own addresses ---
+
+
+@pytest.mark.parametrize("allow_any", [False, True], ids=["participants-only", "allow-any"])
+@pytest.mark.parametrize("field", ["to", "cc"])
+@pytest.mark.parametrize(
+    "address", ["support@example.com", "Billing <BILLING@example.com>"], ids=["own-group", "other-group"]
+)
+async def test_system_addresses_are_always_refused(settings, zammad, allow_any, field, address):
+    extra = {"to": [address]} if field == "to" else {"cc": [address]}
+    shaped = await prepare(with_email(settings, allow_any=allow_any), zammad, **extra)
+    bare = address.split("<")[-1].rstrip(">").lower()
+    assert shaped == f"Error: {bare} is this Zammad's own email address; a reply cannot be sent to it"
+
+
+async def test_several_system_addresses_are_named_together(settings, zammad):
+    shaped = await prepare(
+        with_email(settings, allow_any=True), zammad, to=["support@example.com", "billing@example.com"]
+    )
+    assert shaped == (
+        "Error: support@example.com, billing@example.com are this Zammad's own email addresses; "
+        "a reply cannot be sent to them"
+    )
+
+
+async def test_customer_whose_email_is_a_system_address_has_no_default(email_settings, zammad):
+    zammad.on("GET", "/users/9", json={"id": 9, "email": "billing@example.com"})
+    shaped = await prepare(email_settings, zammad)
+    assert shaped == "Error: this ticket's customer has no email address to reply to; pass `to` explicitly"
+
+
+async def test_customer_without_email_has_no_default(email_settings, zammad):
+    zammad.on("GET", "/users/9", json={"id": 9, "email": None})
+    assert (await prepare(email_settings, zammad)).startswith("Error: this ticket's customer has no email address")
+
+
+async def test_ticket_without_customer_still_uses_agent_participants(email_settings, zammad):
+    zammad.on("GET", "/tickets/4", json={**TICKET, "customer_id": None})
+    preview = await prepare(email_settings, zammad, to=["boss@example.com"])
+    assert preview["to"] == ["boss@example.com"]
+    assert zammad.calls("GET", "/users/9") == []
+
+
+# --- recipient limits and format ---
+
+
+async def test_more_than_ten_recipients_in_total_are_refused(settings, zammad):
     to = [f"to{index}@example.com" for index in range(6)]
     cc = [f"cc{index}@example.com" for index in range(5)]
-    (shaped,) = await session(allow_any, zammad, ("prepare_email_reply", {**PREPARED, "to": to, "cc": cc}))
+    shaped = await prepare(with_email(settings, allow_any=True), zammad, to=to, cc=cc)
     assert shaped == f"Error: at most {MAX_RECIPIENTS} recipients (to and cc together)"
 
 
@@ -268,29 +421,15 @@ async def test_more_than_ten_addresses_in_one_field_fail_validation(email_settin
 
 @pytest.mark.parametrize("value", ["not an address", "a@b.test, c@d.test", "<script>@x.test", "üser@example.com"])
 async def test_malformed_recipients_are_refused(email_settings, zammad, value):
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", {**PREPARED, "to": [value]}))
+    shaped = await prepare(email_settings, zammad, to=[value])
     assert shaped == f"Error: {value!r} is not one plain email address (name@example.com)"
 
 
-async def test_no_customer_article_and_no_to_is_an_error(email_settings, zammad):
-    zammad.on("GET", "/ticket_articles/by_ticket/4", json=[ARTICLES[1]])
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert shaped == "Error: this ticket has no customer email to reply to; pass `to` explicitly"
-
-
-async def test_ticket_without_customer_still_uses_article_participants(email_settings, zammad):
-    zammad.on("GET", "/tickets/4", json={**TICKET, "customer_id": None})
-    (preview,) = await session(
-        email_settings, zammad, ("prepare_email_reply", {**PREPARED, "to": ["boss@example.com"]})
-    )
-    assert preview["to"] == ["boss@example.com"]
-    assert zammad.calls("GET", "/users/9") == []
-
-
-async def test_default_recipient_falls_back_to_from(email_settings, zammad):
-    zammad.on("GET", "/ticket_articles/by_ticket/4", json=ARTICLES[:2])
-    (preview,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert preview["to"] == ["cara@example.com"]
+@pytest.mark.parametrize("subject", ["Re: printer\r\nBcc: x@evil.test", "Re:\nprinter", "Re: printer", "a\tb"])
+async def test_subject_with_control_characters_is_refused(email_settings, zammad, subject):
+    shaped = await prepare(email_settings, zammad, subject=subject)
+    assert shaped == "Error: the subject must be one line without control characters"
+    assert zammad.calls("GET", "/tickets/4") == []
 
 
 # --- preflight ---
@@ -321,28 +460,27 @@ async def test_default_recipient_falls_back_to_from(email_settings, zammad):
 )
 async def test_preflight_explains_a_missing_email_setup(email_settings, fake, group, sender, expected):
     zammad = mailbox(fake, group=group, sender=sender)
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert shaped == expected
+    assert await prepare(email_settings, zammad) == expected
     assert zammad.calls("GET", "/ticket_articles/by_ticket/4") == []
 
 
 async def test_preflight_needs_a_group(email_settings, zammad):
     zammad.on("GET", "/tickets/4", json={**TICKET, "group_id": None})
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert shaped == "Error: ticket 4 has no group, so Zammad has no address to send from"
+    assert await prepare(email_settings, zammad) == (
+        "Error: ticket 4 has no group, so Zammad has no address to send from"
+    )
 
 
-@pytest.mark.parametrize("path", ["/tickets/4", "/groups/1", "/email_addresses/3", "/ticket_articles/by_ticket/4"])
+@pytest.mark.parametrize(
+    "path", ["/tickets/4", "/groups/1", "/email_addresses/3", "/email_addresses", "/ticket_articles/by_ticket/4"]
+)
 async def test_preflight_zammad_errors_become_error_strings(email_settings, zammad, path):
     zammad.on("GET", path, status=403, json={"error": "Not authorized"})
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert shaped.startswith("Error: permission denied (HTTP 403: Not authorized)")
+    assert (await prepare(email_settings, zammad)).startswith("Error: permission denied (HTTP 403: Not authorized)")
 
 
 async def test_prepare_without_a_token(email_settings, zammad):
-    (shaped,) = await session(
-        dataclasses.replace(email_settings, http_token=None), zammad, ("prepare_email_reply", PREPARED)
-    )
+    shaped = await prepare(dataclasses.replace(email_settings, http_token=None), zammad)
     assert shaped == "Error: no Zammad API token is configured for this request"
 
 
@@ -350,19 +488,31 @@ async def test_prepare_without_a_token(email_settings, zammad):
 
 
 async def test_invalid_base64_is_refused(email_settings, zammad):
-    attachment = {"filename": "x.bin", "data": "not base64!"}
-    (shaped,) = await session(
-        email_settings, zammad, ("prepare_email_reply", {**PREPARED, "attachments": [attachment]})
-    )
+    shaped = await prepare(email_settings, zammad, attachments=[{"filename": "x.bin", "data": "not base64!"}])
     assert shaped == "Error: attachment 0 ('x.bin') is not valid base64"
 
 
-async def test_attachments_over_the_limit_are_refused(email_settings, zammad, monkeypatch):
+async def test_attachments_over_the_limit_are_refused_before_decoding(email_settings, zammad, monkeypatch):
     monkeypatch.setattr(email_tools, "MAX_ATTACHMENT_BYTES", 10)
-    data = base64.b64encode(b"123456").decode()
-    attachments = [{"filename": "a", "data": data}, {"filename": "b", "data": data}]
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", {**PREPARED, "attachments": attachments}))
-    assert shaped == "Error: attachments total 12 bytes, over the 10-byte limit"
+    decoded: list[str] = []
+    real_decode = base64.b64decode
+
+    def recording_decode(data: str, **kwargs: Any) -> bytes:
+        decoded.append(data)
+        return real_decode(data, **kwargs)
+
+    monkeypatch.setattr(email_tools.base64, "b64decode", recording_decode)
+    first, second = base64.b64encode(b"123456").decode(), base64.b64encode(b"abcdef").decode()
+    attachments = [{"filename": "a", "data": first}, {"filename": "b", "data": second}]
+    shaped = await prepare(email_settings, zammad, attachments=attachments)
+    assert shaped == "Error: attachments add up to more than the 10-byte limit"
+    assert decoded == [first]
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 3, 10, 11])
+def test_decoded_size_matches_base64(size):
+    data = base64.b64encode(b"x" * size).decode()
+    assert decoded_size(data) == size
 
 
 def test_the_attachment_limit_is_ten_megabytes():
@@ -392,12 +542,11 @@ async def test_expired_token_is_refused(email_settings, zammad, store):
 
 
 async def test_unknown_token_is_refused(email_settings, zammad):
-    args = {"confirmation_token": "made-up", "to": ["cara@example.com"], "subject": "x"}
-    (sent,) = await session(email_settings, zammad, ("send_email_reply", args))
+    (sent,) = await session(email_settings, zammad, ("send_email_reply", {**STRAY_SEND, "confirmation_token": "x"}))
     assert sent.startswith("Error: confirmation token is unknown")
 
 
-async def test_tampered_record_is_refused(email_settings, zammad, store):
+async def test_corrupted_record_is_detected(email_settings, zammad, store):
     async with Client(server.build_server(email_settings, transport=zammad)) as client:
         preview = (await client.call_tool("prepare_email_reply", PREPARED)).data
         backend = store.backends[0]
@@ -406,12 +555,12 @@ async def test_tampered_record_is_refused(email_settings, zammad, store):
         record["payload"]["to"] = ["attacker@evil.test"]
         backend._values = {key: (json.dumps(record), expires_at)}
         sent = (await client.call_tool("send_email_reply", send_args(preview, to=["attacker@evil.test"]))).data
-    assert sent == "Error: confirmation record failed its integrity check; prepare the action again"
+    assert sent == "Error: confirmation record is corrupted; prepare the action again"
     assert zammad.calls("POST", "/ticket_articles") == []
 
 
 async def test_record_holds_the_payload_hash_bound_to_identity_and_action(email_settings, zammad, store):
-    (preview,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
+    preview = await prepare(email_settings, zammad)
     ((key, (raw, _)),) = store.backends[0]._values.items()
     record = json.loads(raw)
     assert (record["identity"], record["action"]) == (token_identity("secret-token"), "email_reply")
@@ -419,9 +568,16 @@ async def test_record_holds_the_payload_hash_bound_to_identity_and_action(email_
     assert preview["confirmation_token"] not in key + raw
 
 
+async def test_outstanding_confirmations_are_capped_per_user(email_settings, zammad):
+    calls = [("prepare_email_reply", PREPARED)] * (MAX_OUTSTANDING_PER_IDENTITY + 1)
+    results = await session(email_settings, zammad, *calls)
+    assert all(isinstance(result, dict) for result in results[:-1])
+    assert results[-1].startswith(f"Error: you already have {MAX_OUTSTANDING_PER_IDENTITY} actions waiting")
+
+
 @pytest.mark.parametrize(
     "changes",
-    [{"to": ["cara@example.com"]}, {"subject": "Re: something else"}, {"to": ["not an address"]}],
+    [{"to": ["colleague@example.com"]}, {"subject": "Re: something else"}, {"to": ["not an address"]}],
 )
 async def test_echo_mismatch_sends_nothing_and_spends_the_token(email_settings, zammad, changes):
     async with Client(server.build_server(email_settings, transport=zammad)) as client:
@@ -437,10 +593,8 @@ async def test_echo_mismatch_sends_nothing_and_spends_the_token(email_settings, 
 
 
 def api_key_call(client: TestClient, token: str, name: str, arguments: dict[str, Any]) -> str:
-    result = rpc(
-        client, "/http/api-key/mcp", "tools/call", {"name": name, "arguments": arguments}, {"X-Zammad-Token": token}
-    )
-    return tool_text(result)
+    params = {"name": name, "arguments": arguments}
+    return tool_text(rpc(client, "/http/api-key/mcp", "tools/call", params, {"X-Zammad-Token": token}))
 
 
 async def test_token_issued_to_one_user_is_refused_for_another(api_key_settings, fake):
@@ -480,8 +634,8 @@ async def test_unknown_or_ticketless_tiers_are_refused(email_settings, make_fake
 
 
 async def test_send_without_a_token_is_an_error(email_settings, zammad):
-    args = STRAY_SEND
-    (shaped,) = await session(dataclasses.replace(email_settings, http_token=None), zammad, ("send_email_reply", args))
+    no_token = dataclasses.replace(email_settings, http_token=None)
+    (shaped,) = await session(no_token, zammad, ("send_email_reply", STRAY_SEND))
     assert shaped == "Error: no Zammad API token is configured for this request"
 
 
@@ -514,7 +668,7 @@ async def test_connect_failure_says_nothing_was_sent(email_settings, zammad):
     assert sent == "Error: could not reach Zammad (ConnectError); the reply was not sent, prepare it again"
 
 
-async def test_zammad_refusing_the_article_is_reported(email_settings, zammad):
+async def test_zammad_refusing_the_article_is_reported(email_settings, zammad, caplog):
     zammad.on(
         "POST",
         "/ticket_articles",
@@ -526,6 +680,26 @@ async def test_zammad_refusing_the_article_is_reported(email_settings, zammad):
         "Error: Zammad rejected the request (HTTP 422): "
         "This group has no email address configured for outgoing communication."
     )
+    assert audit_lines(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(201, content=b"<html>not json</html>"),
+        httpx.Response(201, json=["not", "an", "article"]),
+        httpx.Response(201, json={"no": "id"}),
+    ],
+    ids=["not-json", "list", "no-id"],
+)
+async def test_accepted_but_unreadable_send_is_audited_as_unknown(email_settings, zammad, caplog, response):
+    caplog.set_level(logging.INFO, logger="zammad_mcp.audit")
+    zammad.on("POST", "/ticket_articles", handler=lambda _request: response)
+    _, sent = await prepare_then_send(email_settings, zammad, PREPARED)
+    assert sent == SENT_UNREADABLE
+    assert len(zammad.calls("POST", "/ticket_articles")) == 1
+    (line,) = audit_lines(caplog)
+    assert "ticket_id=4 article_id=unknown recipients=1" in line
 
 
 # --- confirmation store failures ---
@@ -536,8 +710,7 @@ async def test_store_failure_on_prepare(email_settings, zammad, monkeypatch):
         raise ConnectionError("valkey down")
 
     monkeypatch.setattr(Confirmations, "issue", broken)
-    (shaped,) = await session(email_settings, zammad, ("prepare_email_reply", PREPARED))
-    assert shaped == CONFIRMATION_STORE_DOWN
+    assert await prepare(email_settings, zammad) == CONFIRMATION_STORE_DOWN
 
 
 async def test_store_failure_on_send(email_settings, zammad, monkeypatch):
@@ -545,8 +718,7 @@ async def test_store_failure_on_send(email_settings, zammad, monkeypatch):
         raise ConnectionError("valkey down")
 
     monkeypatch.setattr(Confirmations, "redeem", broken)
-    args = STRAY_SEND
-    (shaped,) = await session(email_settings, zammad, ("send_email_reply", args))
+    (shaped,) = await session(email_settings, zammad, ("send_email_reply", STRAY_SEND))
     assert shaped == CONFIRMATION_STORE_DOWN
     assert zammad.calls("POST", "/ticket_articles") == []
 
@@ -555,8 +727,8 @@ async def test_store_failure_on_send(email_settings, zammad, monkeypatch):
 
 
 def test_parse_addresses_keeps_well_formed_addresses_once():
-    lines = ["Cara <CARA@example.com>, bob@example.com", None, "cara@example.com; junk", "<evil>@x.test"]
-    assert parse_addresses(lines) == ["cara@example.com", "bob@example.com"]
+    lines = ["Cara <CARA@example.com>, bob@example.com", None, "", "<evil>@x.test", "dan@example.com"]
+    assert parse_addresses(lines) == ["cara@example.com", "bob@example.com", "dan@example.com"]
 
 
 def test_normalize_recipients_deduplicates():
