@@ -175,5 +175,6 @@ def _error(status: int, message: str) -> httpx.Response:
 def identity(
     email: str = "ada@example.com", *, access_token: str | None = "upstream-access", username: str | None = None
 ) -> Identity:
-    claims = {"id_token": "id", **({"cognito:username": username} if username else {})}
+    stamp = {"cognito:username": username, "preferred_username": username} if username else {}
+    claims = {"id_token": "id", **stamp}
     return Identity(email=email, access_token=access_token, claims=claims)

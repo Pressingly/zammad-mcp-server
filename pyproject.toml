@@ -44,7 +44,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=5",
     "ruff>=0.6",
-    "fakeredis>=2.26",
+    "fakeredis[lua]>=2.26",
 ]
 
 [build-system]

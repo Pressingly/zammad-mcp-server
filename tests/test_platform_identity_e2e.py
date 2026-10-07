@@ -76,7 +76,7 @@ async def sign_in(provider, keys: RSAKeyPair, email: str, username: str) -> str:
         scopes=["openid"],
         additional_claims={"token_use": "access", "username": f"uuid-{username}", "client_id": CLIENT_ID},
     )
-    id_token = jwt.encode({"email": email, "cognito:username": username}, "k" * 32)
+    id_token = jwt.encode({"email": email, "cognito:username": username, "preferred_username": username}, "k" * 32)
     now = time.time()
     upstream_id, jti = f"up-{username}", f"jti-{username}"
     await provider._upstream_token_store.put(

@@ -63,25 +63,33 @@ def test_identity_for_needs_a_token():
 
 
 @pytest.mark.parametrize(
-    ("email", "username", "default_domain", "synthetic"),
+    ("email", "username", "preferred", "default_domain", "synthetic"),
     [
-        ("ada@example.com", "sid-1", "askii.ai", False),
-        ("sid-1@askii.ai", "sid-1", "askii.ai", True),
-        ("sid-1@askii.ai", "SID-1", " ASKII.AI ", True),
-        ("jane@askii.ai", "sid-1", "askii.ai", False),
-        ("jane@askii.ai", None, "askii.ai", True),
-        ("sid-1@sub.askii.ai", "sid-1", "askii.ai", False),
-        ("9990000000000001", "9990000000000001", "askii.ai", True),
-        ("9990000000000001", None, None, True),
-        ("@askii.ai", "sid-1", "askii.ai", True),
-        ("x@", "sid-1", "askii.ai", True),
-        ("sid-1@askii.ai", "sid-1", "", False),
+        ("ada@example.com", "sid-1", None, "askii.ai", False),
+        ("sid-1@askii.ai", "sid-1", "sid-1", "askii.ai", True),
+        ("sid-1@askii.ai", "SID-1", "SID-1", " ASKII.AI ", True),
+        ("jane@askii.ai", "sid-1", "sid-1", "askii.ai", False),
+        ("jane@askii.ai", "sid-1", None, "askii.ai", True),
+        ("jane@askii.ai", "sid-1", "sid-2", "askii.ai", True),
+        ("victim-sid@askii.ai", "attacker-sid", None, "askii.ai", True),
+        ("victim-sid@askii.ai", "attacker-sid", "victim-sid", "askii.ai", True),
+        ("jane@askii.ai", None, "sid-1", "askii.ai", True),
+        ("sid-1@sub.askii.ai", "sid-1", None, "askii.ai", False),
+        ("9990000000000001", "9990000000000001", None, "askii.ai", True),
+        ("9990000000000001", None, None, None, True),
+        ("@askii.ai", "sid-1", "sid-1", "askii.ai", True),
+        ("x@", "sid-1", "sid-1", "askii.ai", True),
+        ("sid-1@askii.ai", "sid-1", None, "", False),
     ],
     ids=[
         "real-address",
         "exact-synthetic-shape",
         "case-insensitive",
         "real-address-on-the-synthetic-domain",
+        "unstamped-token-on-the-synthetic-domain",
+        "stamp-for-another-user",
+        "victim-sid-unstamped",
+        "victim-sid-stamped-as-the-victim",
         "domain-match-without-username-fails-closed",
         "subdomain",
         "bare-username",
@@ -91,8 +99,11 @@ def test_identity_for_needs_a_token():
         "no-default-domain",
     ],
 )
-def test_synthetic_identities(email, username, default_domain, synthetic):
-    claims = {"cognito:username": username} if username else {}
+def test_synthetic_identities(email, username, preferred, default_domain, synthetic):
+    claims = {
+        **({"cognito:username": username} if username else {}),
+        **({"preferred_username": preferred} if preferred else {}),
+    }
 
     assert Identity(email=email, claims=claims).is_synthetic(default_domain) is synthetic
 
@@ -102,7 +113,7 @@ def test_identity_for_carries_the_cognito_username():
         token="t",
         client_id="c",
         scopes=[],
-        claims=claims(email="Jane@AskII.ai", **{"cognito:username": "sid-9"}),
+        claims=claims(email="Jane@AskII.ai", preferred_username="sid-9", **{"cognito:username": "sid-9"}),
     )
 
     found = identity_for(token)

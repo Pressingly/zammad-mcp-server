@@ -21,6 +21,7 @@ from tests.platform_fakes import (
 from zammad_mcp.client.errors import AccountInactiveError, GatewayDeniedError, ZammadTransportError, to_tool_error
 from zammad_mcp.client.http import USER_AGENT, is_identity_header
 from zammad_mcp.platform.ceiling import MINTABLE_PERMISSIONS
+from zammad_mcp.platform.identity import Identity
 from zammad_mcp.platform.mint import (
     CACHE_KEY_PREFIX,
     CACHE_SALT,
@@ -744,3 +745,12 @@ async def test_an_unreadable_marker_is_ignored(minter, store, zammad):
     await minter.token_for(identity(AGENT))
 
     assert len(zammad.gets()) == 1
+
+
+async def test_another_users_synthetic_address_is_refused(minter, zammad):
+    victim = Identity(email="victim-sid@askii.ai", claims={"id_token": "id", "cognito:username": "attacker-sid"})
+
+    with pytest.raises(SyntheticIdentityError):
+        await minter.token_for(victim)
+
+    assert zammad.requests == []

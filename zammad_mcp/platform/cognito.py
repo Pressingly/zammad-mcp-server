@@ -37,6 +37,7 @@ UPSTREAM_CLAIMS_KEY = "upstream_claims"
 ID_TOKEN_KEY = "id_token"
 EMAIL_CLAIM = "email"
 COGNITO_USERNAME_CLAIM = "cognito:username"
+PREFERRED_USERNAME_CLAIM = "preferred_username"
 ACCESS_TOKEN_CLAIM = "access_token"
 
 MIN_EXPIRES_IN_SECONDS = 60
@@ -126,6 +127,7 @@ class ZammadCognitoProvider(AWSCognitoProvider):
             ID_TOKEN_KEY: id_token,
             EMAIL_CLAIM: _string(claims.get(EMAIL_CLAIM)),
             COGNITO_USERNAME_CLAIM: _string(claims.get(COGNITO_USERNAME_CLAIM)),
+            PREFERRED_USERNAME_CLAIM: _string(claims.get(PREFERRED_USERNAME_CLAIM)),
             ACCESS_TOKEN_CLAIM: _string(idp_tokens.get(ACCESS_TOKEN_CLAIM)) if include_access_token else None,
         }
         return {key: value for key, value in extracted.items() if value is not None}

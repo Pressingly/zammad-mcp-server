@@ -9,7 +9,9 @@ from fastmcp.server.auth.providers.aws import AWSCognitoProvider
 
 from zammad_mcp.platform.cognito import ACCESS_TOKEN_CLAIM, UPSTREAM_CLAIMS_KEY, ZammadCognitoProvider
 
-ID_TOKEN = jwt.encode({"email": "ada@example.com", "cognito:username": "sid-1"}, "k" * 32)
+ID_TOKEN = jwt.encode(
+    {"email": "ada@example.com", "cognito:username": "sid-1", "preferred_username": "sid-1"}, "k" * 32
+)
 
 
 @pytest.fixture
@@ -37,7 +39,12 @@ async def test_extract_keeps_identity_and_gates_the_access_token(provider):
     sealed = await provider._extract_upstream_claims(tokens)
     resolved = await provider._extract_upstream_claims(tokens, include_access_token=True)
 
-    assert sealed == {"id_token": ID_TOKEN, "email": "ada@example.com", "cognito:username": "sid-1"}
+    assert sealed == {
+        "id_token": ID_TOKEN,
+        "email": "ada@example.com",
+        "cognito:username": "sid-1",
+        "preferred_username": "sid-1",
+    }
     assert ACCESS_TOKEN_CLAIM not in sealed
     assert resolved[ACCESS_TOKEN_CLAIM] == "upstream"
 

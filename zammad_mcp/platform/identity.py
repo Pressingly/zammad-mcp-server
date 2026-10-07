@@ -21,6 +21,7 @@ from zammad_mcp.platform.cognito import (
     COGNITO_USERNAME_CLAIM,
     EMAIL_CLAIM,
     ID_TOKEN_KEY,
+    PREFERRED_USERNAME_CLAIM,
     UPSTREAM_CLAIMS_KEY,
 )
 
@@ -79,6 +80,12 @@ class Identity:
         return _non_empty(self.claims.get(COGNITO_USERNAME_CLAIM))
 
     @property
+    def stamped_by_overlay(self) -> bool:
+        """mpass-auth-proxy's email overlay sets ``preferred_username`` to the caller's own ``cognito:username``."""
+        username = self.cognito_username
+        return username is not None and _non_empty(self.claims.get(PREFERRED_USERNAME_CLAIM)) == username
+
+    @property
     def key(self) -> str:
         return hash_identity(self.email)
 
@@ -99,8 +106,15 @@ class Identity:
         ``<cognito:username>@<DEFAULT_EMAIL_DOMAIN>``. The domain alone proves
         nothing, since it can also be a real mail domain. Zammad's middleware
         appends the domain to any claim without ``@``, so a bare value is
-        synthetic too. A domain match without a ``cognito:username`` to
-        compare against fails closed.
+        synthetic too.
+
+        Any other address in that domain is accepted only from a token the
+        overlay stamped (``preferred_username == cognito:username``): the
+        overlay only ever emits the caller's own synthetic address or a real
+        address the launchpad verified, and the launchpad refuses another
+        account's synthetic address. An unstamped token could carry
+        ``<someone-else's-sid>@<domain>``, so it fails closed, and so does a
+        missing ``cognito:username``.
         """
         if self.domain is None:
             return True
@@ -108,7 +122,9 @@ class Identity:
         if not domain or self.domain != domain:
             return False
         username = self.cognito_username
-        return username is None or self.email == f"{username}@{domain}".lower()
+        if username is None or self.email == f"{username}@{domain}".lower():
+            return True
+        return not self.stamped_by_overlay
 
 
 def identity_for(token: AccessToken | None) -> Identity | None:

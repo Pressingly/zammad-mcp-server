@@ -48,8 +48,11 @@ platform user carries exactly `<cognito:username>@<DEFAULT_EMAIL_DOMAIN>` (mpass
 Zammad's middleware turns a value without `@` into `<value>@DEFAULT_EMAIL_DOMAIN`. The server refuses both shapes
 before sending anything to Zammad, because the first request of any kind would create that user, and tells the user
 to verify their email in the portal first. It matches the launchpad verify-gate (ADR-0004): the domain alone is not
-enough, since it can also be a real mail domain (`jane@askii.ai` is minted). An address in that domain with no
-`cognito:username` to compare against is refused.
+enough, since it can also be a real mail domain (`jane@askii.ai` is minted). Any other address in that domain is
+accepted only from a token mpass-auth-proxy's email overlay stamped (`preferred_username == cognito:username`): the
+overlay only emits the caller's own synthetic address or a launchpad-verified real one, so an unstamped token
+carrying someone else's `<sid>@<domain>` is refused, as is an address there without a `cognito:username`. With
+email capture off, mpass does not stamp tokens, so real addresses in `DEFAULT_EMAIL_DOMAIN` are refused too.
 
 ## Cache, lifetime and role changes
 
