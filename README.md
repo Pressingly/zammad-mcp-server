@@ -142,7 +142,9 @@ fields (`to` and `subject` for email, `macro_id` and `ticket_ids` for macros), a
 - is stored as a hash, next to the sha256 of the exact payload. Recomputing that digest on use detects a corrupted
   record, not a forged one. Tamper protection for a shared store comes from the platform-mode Valkey backend, which
   encrypts records with Fernet (authenticated encryption);
-- is limited to 20 waiting per user, and the in-memory store holds at most 64 MiB of them.
+- is limited to 20 waiting per user. In the in-memory store each user may hold at most a quarter of its 128 MiB
+  (sizes are UTF-8 bytes of the stored JSON), and records over 64 KiB cannot use the last 8 MiB, which stay free
+  for small ones such as macro confirmations. The largest possible email record is about 20 MB.
 
 Email replies:
 
@@ -151,7 +153,8 @@ Email replies:
 - `to` defaults to the ticket customer's email.
 - A ticket's **participants** are:
   - the ticket customer's email;
-  - the From, To and Cc of every public article an agent wrote;
+  - the From, To and Cc of every public article an agent wrote. An agent email counts only when Zammad sent it
+    itself (it carries `preferences.email_address_id`); agent notes, phone and web articles always count;
   - the From, To, Cc and Reply-To of every public article the ticket's customer wrote (matched by the article's
     author or on-behalf-of user, or by its From address).
 
@@ -160,8 +163,18 @@ Email replies:
 - No recipient may be one of Zammad's own email addresses (any group's), with or without
   `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT`.
 - The preview lists a `recipient_warnings` entry for every recipient who is not the ticket's customer.
-- Limits: at most 10 recipients (to and cc together), a body of 1,000,000 characters, and 10 MB of attachment
-  content (decoded). The subject must be one line without control characters.
+- Limits: at most 10 recipients (to and cc together) of up to 320 characters each, a body of 1,000,000
+  characters, and up to 20 attachments with 10 MB of attachment content (decoded) in total. The subject must be one
+  line, without control characters or bidi embeddings and overrides (emoji joiners and LRM/RLM marks are fine).
+- Spoofing that remains possible, because Zammad trusts the From header of inbound mail:
+  - Mail with a forged From of the **customer's** address is filed as the customer's message, so its Reply-To and Cc
+    become participants.
+  - Mail with a forged From of one of **Zammad's own** addresses is filed as sent by an Agent. This server ignores
+    such articles because they lack `preferences.email_address_id`, which relies on Zammad setting that only on mail
+    it sends (true in Zammad 7.1).
+
+  Neither can change the default `to`, and every recipient other than the customer is flagged in
+  `recipient_warnings`, so the user sees it before confirming.
 - `send_email_reply` posts one `email` article (sender Agent, not internal) and is never retried once the request
   may have reached Zammad. Zammad delivers the email in the background, so the result is `queued`. When the outcome
   is unclear (a timeout, a 5xx, or a 2xx whose answer cannot be read) the error says so and asks to check the
