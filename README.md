@@ -35,9 +35,11 @@ image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it
   with the caller's minted token. `/http/api-key/mcp` stays available for personal tokens.
 - A token carries an explicit list: `ticket.agent`, `ticket.customer`, `knowledge_base.reader` and
   `knowledge_base.editor`, intersected with the user's role. Never `admin.*`, `report` or `user_preferences.*`.
-- Tokens last at least 8 days, are cached for 6 (Fernet-encrypted in Valkey), are re-checked every 4 hours and
+- Tokens last about 8 days, are cached for 6 (Fernet-encrypted in Valkey), are re-checked every 4 hours and
   after a permission-gated 403, and are re-minted after a 401. Only expired tokens of this server are cleaned up.
-- Unverified users (an identity in `DEFAULT_EMAIL_DOMAIN`, or without `@`) are refused before any Zammad call.
+- Unverified users (exactly `<cognito:username>@DEFAULT_EMAIL_DOMAIN`, or an identity without `@`) are refused
+  before any Zammad call. Real addresses in that domain are served.
+- Each bootstrap signs its Zammad web session out again, so no full-privilege session is left behind.
 - The tool list is filtered per user and fails closed: if the mint fails, only `get_me` is listed, and it explains
   why.
 - Every failure fails closed; there is no fallback to a shared token.
@@ -50,9 +52,10 @@ image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it
 | `OIDC_CLIENT_SECRET` or `MCP_JWT_SIGNING_KEY` | one required | Client secret (confidential client) or signing key (public client) |
 | `MCP_BASE_URL` | required | Public URL of this server; register `<MCP_BASE_URL>/auth/callback` in Cognito |
 | `ZAMMAD_INTERNAL_BASE_URL` | required | Zammad on the internal network; every Zammad call goes here |
-| `DEFAULT_EMAIL_DOMAIN` | required | Domain of unverified users, who are refused |
+| `DEFAULT_EMAIL_DOMAIN` | required | Bare domain of unverified users' synthetic addresses, which are refused |
 | `MCP_OAUTH_STORAGE_URL` | unset | Valkey URL (`redis://`, `rediss://`, `valkey://`, `valkeys://`) for OAuth state, tokens and confirmations |
-| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | unset (any) | Comma-separated redirect URI patterns for client registration |
+| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | required | Comma-separated redirect URI patterns for client registration; empty refuses to start |
+| `MCP_ALLOW_ANY_REDIRECT_URI` | `false` | `true` with no allow-list accepts any redirect URI (explicit opt-out) |
 | `COGNITO_UPSTREAM_AUTH_URL` / `COGNITO_UPSTREAM_TOKEN_URL` | discovered | Route `/authorize` and `/token` through an auth proxy |
 | `MCP_ACCESS_TOKEN_TTL_SECONDS` | `86400` | Lifetime of the token issued to the MCP client |
 | `MCP_OIDC_SCOPES` | `openid` | Upstream scopes |

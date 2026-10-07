@@ -36,31 +36,45 @@ own against `ZAMMAD_INTERNAL_BASE_URL` and:
    by hand into a `Cookie` header together with `X-CSRF-Token`.
 4. Deletes, best effort, this user's own expired `zammad-mcp*` tokens. A live token is never revoked, since another
    replica may be using it.
+5. Always, even when an earlier step failed: `DELETE /api/v1/signout` with the same cookie. The middleware opened a
+   persistent web session carrying the user's full role; signing out deletes that session row at once instead of
+   leaving it for Zammad's four-week session reaper. It ends only this session, never the user's browser sessions.
 
 Every bootstrap request sends the same `X-Browser-Fingerprint` and `User-Agent` as the steady-state client, so
 Zammad records one device per user and sends at most one new-device email.
 
-The identity is the id_token's `email` (lowercased), or `cognito:username` when there is no email. Zammad's
-middleware turns a value without `@` into `<value>@DEFAULT_EMAIL_DOMAIN`, the domain of unverified platform users.
-The server refuses both cases (no `@`, or a domain equal to `DEFAULT_EMAIL_DOMAIN`) before sending anything to
-Zammad, because the first request of any kind would create that user. The user is told to verify their email in
-the portal first.
+The identity is the id_token's `email` (lowercased), or `cognito:username` when there is no email. An unverified
+platform user carries exactly `<cognito:username>@<DEFAULT_EMAIL_DOMAIN>` (mpass-auth-proxy's email overlay), and
+Zammad's middleware turns a value without `@` into `<value>@DEFAULT_EMAIL_DOMAIN`. The server refuses both shapes
+before sending anything to Zammad, because the first request of any kind would create that user, and tells the user
+to verify their email in the portal first. It matches the launchpad verify-gate (ADR-0004): the domain alone is not
+enough, since it can also be a real mail domain (`jane@askii.ai` is minted). An address in that domain with no
+`cognito:username` to compare against is refused.
 
 ## Cache, lifetime and role changes
 
-- The token is cached under `zammad-mcp:token:v1:<sha256(identity)>`, Fernet-encrypted with a key derived from
-  `OIDC_CLIENT_SECRET` (or `MCP_JWT_SIGNING_KEY`). The value holds the token, permissions, tier, the ceiling
-  fingerprint, `expires_at` and `checked_at`.
-- Zammad stores a date-only `expires_at` as 00:00 UTC, so a token lives at least 8 days. The cache keeps it for 6
-  days and treats it as stale from one day before expiry.
+- The token is cached under `zammad-mcp:token:v1:<namespace>:<sha256(identity)>`, Fernet-encrypted with a key
+  derived from `OIDC_CLIENT_SECRET` (or `MCP_JWT_SIGNING_KEY`). The namespace is a short hash of `OIDC_CLIENT_ID`
+  and `ZAMMAD_INTERNAL_BASE_URL`, so two deployments sharing one Valkey database never read each other's tokens.
+  The value holds the token, its name, permissions, tier, the ceiling fingerprint, `expires_at` and `checked_at`.
+- Zammad stores a date-only `expires_at` as the start of that day in its `timezone_default` (00:00 UTC on a default
+  install), so a token asked for `today + 9 days` lives about 8 days. The cache keeps it for 6 days and treats it as
+  stale from one day before 00:00 UTC of the expiry date, which stays ahead of the real expiry in any time zone.
 - Downgrades apply at once, because Zammad intersects the role and the token on every check.
-- Upgrades are found by a re-check every 4 hours, and after a role-gated 403 (at most once per 5 minutes per
-  identity, through `SET NX EX`). A changed ceiling mints a new token.
+- Upgrades are found by a re-check every 4 hours, and after a role-gated 403. The 403 only writes a re-check
+  marker (`SET NX EX`, so at most once per 5 minutes per identity) and never rewrites the cached token, so it cannot
+  race a concurrent re-mint; a token checked after the marker was set needs no re-check. A changed ceiling mints a
+  new token.
 - A 401 (expired or revoked token) drops the cache entry, mints once and retries the request once.
 - A denial while re-checking (corporate gate, customer token access withdrawn) drops the cache entry and fails the
   request. Token auth itself does not pass the corporate gate, so a user removed from the corporate ID keeps access
   until the next re-check, at most 4 hours.
-- Any cache or mint error fails the request with an `Error: ...` message. Nothing falls back to another token.
+- Any cache or mint error fails the request with an `Error: ...` message. Nothing falls back to another token. The
+  one exception is an entry that no longer decrypts (a rotated secret): it is treated as absent and re-minted.
+- Every decision writes one JSON line on the `zammad_mcp.audit` logger: `token.minted` (with the reason),
+  `token.recheck_unchanged`, `token.recheck_requested`, `token.renew_reused`, `token.denied` and `token.refused`.
+  Each carries the identity hash and, where there is a token, its tier, sorted permissions and name. Never the token
+  or the email.
 
 ## Tool visibility
 
@@ -88,11 +102,15 @@ Valkey database holds:
 | Keys | Content |
 |---|---|
 | FastMCP collections | OAuth state (clients, transactions, codes, upstream tokens, JTI mappings), Fernet-encrypted |
-| `zammad-mcp:token:v1:*` | Minted tokens, Fernet-encrypted |
-| `zammad-mcp:recheck:v1:*` | The 5-minute 403 re-check limiter |
+| `zammad-mcp:token:v1:<namespace>:*` | Minted tokens, Fernet-encrypted |
+| `zammad-mcp:recheck:v1:<namespace>:*` | 403 re-check markers, 5-minute TTL |
 | `zammad-mcp:confirm:v1:*` | Two-step confirmations, Fernet-encrypted (they can hold a whole email) |
+| `zammad-mcp:confirm-bytes:v1:<namespace>` | Sizes of live confirmations, for the byte cap |
 
-Without it everything lives in process: it is lost on restart and not shared between replicas.
+Confirmations in Valkey share a 128 MiB cap (plaintext bytes; Fernet adds about a third in Valkey memory), with the
+last 8 MiB kept for small records, like the in-process store. A full store refuses the next large record with a
+clear message. Without `MCP_OAUTH_STORAGE_URL` everything lives in process: it is lost on restart and not shared
+between replicas.
 
 ## Configuration
 
@@ -105,10 +123,11 @@ Without it everything lives in process: it is lost on restart and not shared bet
 | `MCP_JWT_SIGNING_KEY` | | Signing key for public (PKCE) clients; needed when there is no client secret |
 | `MCP_BASE_URL` | required | Public URL of this server, e.g. `https://support-mcp.example.com` |
 | `ZAMMAD_INTERNAL_BASE_URL` | required | Zammad on the internal network, e.g. `http://zammad-nginx:8080`; every Zammad call goes here |
-| `DEFAULT_EMAIL_DOMAIN` | required | The domain Zammad's middleware gives unverified users; such identities are refused |
+| `DEFAULT_EMAIL_DOMAIN` | required | Synthetic domain of unverified users (a bare domain: no `@`, scheme or trailing dot); `<cognito:username>@` it is refused |
 | `ZAMMAD_PUBLIC_URL` | `ZAMMAD_URL` | Base URL for the `url` links in results |
 | `MCP_OAUTH_STORAGE_URL` | unset | Valkey URL for OAuth state, the token cache and confirmations |
-| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | unset (any) | Comma-separated redirect URI patterns (fnmatch) for dynamic client registration |
+| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | required | Comma-separated redirect URI patterns (fnmatch) for dynamic client registration, e.g. `https://claude.ai/api/mcp/auth_callback,http://localhost:*/*`. An empty value refuses to start |
+| `MCP_ALLOW_ANY_REDIRECT_URI` | `false` | `true` (with no allow-list) accepts any redirect URI, with a startup warning |
 | `COGNITO_UPSTREAM_AUTH_URL` | discovered | Send users to an auth proxy's `/authorize` instead of Cognito's hosted UI |
 | `COGNITO_UPSTREAM_TOKEN_URL` | discovered | Exchange codes through an auth proxy's `/token` |
 | `MCP_OIDC_SCOPES` | `openid` | Upstream scopes, space- or comma-separated |
