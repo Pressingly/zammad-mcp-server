@@ -5,9 +5,9 @@ It lets Claude, or any MCP client, work with Zammad tickets using **the caller's
 request carries a per-user API token, never a shared admin token, so Zammad itself decides what each user can see
 and change.
 
-Status: community core. Ticket, article, attachment, search, user, organization and tag tools work in stdio and
-HTTP. Tag writes, the knowledge base and email replies land next; platform mode (SSO with per-user minted tokens)
-after that.
+Status: community core. Ticket, article, attachment, search, user, organization, tag and knowledge base tools
+work in stdio and HTTP, and email replies and macros are available behind opt-in flags. Platform mode (SSO with
+per-user minted tokens) lands next.
 
 ## Modes
 
@@ -81,12 +81,17 @@ Point the MCP client at `http://<host>:8214/http/api-key/mcp` with the header `X
 | `ZAMMAD_ENABLE_SEARCH` | `true` | Global `search` |
 | `ZAMMAD_ENABLE_USERS` | `true` | `get_user`, `search_users` |
 | `ZAMMAD_ENABLE_ORGANIZATIONS` | `true` | `get_organization`, `search_organizations` |
-| `ZAMMAD_ENABLE_TAGS` | `true` | `list_ticket_tags` |
+| `ZAMMAD_ENABLE_TAGS` | `true` | `list_ticket_tags`, `add_ticket_tag`, `remove_ticket_tag` |
+| `ZAMMAD_ENABLE_KB` | `true` | `search_knowledge_base`, `get_kb_answer` |
+| `ZAMMAD_ENABLE_EMAIL_REPLIES` | `false` | `prepare_email_reply`, `send_email_reply`. Needs an outgoing email channel in Zammad |
+| `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT` | `false` | `true` lets email replies go to any address, not only the ticket's participants |
+| `ZAMMAD_ENABLE_MACROS` | `false` | `list_macros`, `prepare_apply_macro`, `apply_macro` |
 | `ZAMMAD_FILTER_TOOLS_BY_ROLE` | `false` | Hide agent-only tools from customer tokens in the tool list (Zammad enforces permissions either way) |
-| `ZAMMAD_CONFIRM_TTL_SECONDS` | `600` | Lifetime of a two-step confirmation token (used by the coming email and merge tools) |
+| `ZAMMAD_CONFIRM_TTL_SECONDS` | `600` | Lifetime of a two-step confirmation token (email replies and macros) |
 | `MCP_HTTP_PORT` | `8214` | Listen port in `http` mode |
 
-A disabled module's tools are never registered. Flags accept `true`, `1`, `yes` or `on`, with surrounding spaces
+A disabled module's tools are never registered, and `ZAMMAD_READ_ONLY=true` leaves out every tool that changes
+Zammad, including the email and macro tools. Flags accept `true`, `1`, `yes` or `on`, with surrounding spaces
 ignored.
 
 ## Tools
@@ -104,17 +109,55 @@ ignored.
 | `get_user` | all | One user (customers: themselves and their organization) |
 | `get_organization` | all | One organization (customers: their own) |
 | `list_ticket_tags` | all | The tags on a ticket |
+| `search_knowledge_base` | all | Knowledge base answers with a snippet; customers find published answers only |
+| `get_kb_answer` | all | One knowledge base answer, every translation's title and plain-text body |
 | `create_ticket` | all | A new ticket with a first public message; agents name the customer |
 | `update_ticket` | all | Title, state, priority, group, owner or pending time |
 | `add_ticket_note` | all | Agents: an internal note by default; customers: a public reply. Never sends email |
 | `search_users` | agents | Users by name, login, email or phone |
 | `search_organizations` | agents | Organizations by name or domain |
 | `get_ticket_history` | agents | A ticket's change history, newest first |
+| `add_ticket_tag` | agents | Add a tag; a new tag needs Zammad's `tag_new` setting |
+| `remove_ticket_tag` | agents | Remove a tag |
+| `prepare_email_reply` | agents, opt-in | Check the group's outgoing address, settle recipients and attachments, return a preview and a confirmation token. Sends nothing |
+| `send_email_reply` | agents, opt-in | Send the approved reply as one email article; returns the article id and `queued` |
+| `list_macros` | agents, opt-in | Active macros, with the groups each is limited to |
+| `prepare_apply_macro` | agents, opt-in | Preview a macro on up to 50 tickets and return a confirmation token. Changes nothing |
+| `apply_macro` | agents, opt-in | Apply the approved macro through `POST /tickets/mass_macro` |
 
 The "Who" column is a convenience: Zammad still decides what each token may do. Callers whose role has no
 `ticket.*` permission (for example an Admin-only account) report tier `none`. Article bodies are
 cut to 4000 characters with a `truncated` flag and a hint. Search on a Zammad without Elasticsearch is a
 case-insensitive substring match with no field syntax or ranking; use the `search_tickets` filters to narrow it.
+
+### Two-step tools
+
+Sending an email and applying a macro each take two calls. The `prepare_*` tool checks the request, stores it
+behind a confirmation token and returns a preview for the user. The confirming tool must echo the preview's key
+fields (`to` and `subject` for email, `macro_id` and `ticket_ids` for macros), and its token:
+
+- works once, and is spent even when a check then fails;
+- expires after `ZAMMAD_CONFIRM_TTL_SECONDS`;
+- only works for the user it was issued to;
+- is stored as a hash, next to the sha256 of the exact payload, which is checked again on use.
+
+Email replies:
+
+- `prepare_email_reply` fails clearly when the ticket's group has no outgoing email address, or the address has no
+  active email channel (Zammad: Admin, Groups and Admin, Channels, Email).
+- `to` defaults to the newest customer message's Reply-To, else its From. Unless
+  `ZAMMAD_EMAIL_ALLOW_ANY_RECIPIENT=true`, every recipient must already be on the ticket: its customer, or an address
+  on one of its articles. At most 10 recipients (to and cc together) and 10 MB of base64 attachments.
+- `send_email_reply` posts one `email` article (sender Agent, not internal) and is never retried once the request
+  may have reached Zammad. Zammad delivers the email in the background, so the result is `queued`. Each send writes
+  one audit log line (`zammad_mcp.audit`) with the caller's identity hash, ticket, article and recipient count,
+  never the body.
+
+Macros:
+
+- Only active macros are listed or applied. Zammad itself would run an inactive one.
+- `apply_macro` uses `POST /tickets/mass_macro`, which checks the macro's group restriction and your change access
+  on every ticket and changes nothing if any ticket fails.
 
 Every tool declares all four MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
 and returns an `Error: ...` string instead of raising, so the model sees what went wrong.
@@ -129,8 +172,8 @@ and returns an `Error: ...` string instead of raising, so the model sees what we
   organization names and domains; tag names; search hit titles, names and emails; history authors and values.
   Inside a frame every `&` and `<` (and the full-width and small `<` look-alikes) is escaped and invisible format
   characters are removed, so no spelling of a closing tag survives. Not framed: ids, numbers, timestamps, flags,
-  roles, and state, priority and group names, which only admins set. Tools that send email will be disabled by
-  default and need a two-step confirmation.
+  roles, and state, priority, group and macro names, which only admins set. Knowledge base titles, snippets and
+  bodies are framed too. Tools that send email are disabled by default and need a two-step confirmation.
 - **`/mcp` with a shared token acts as that token's owner.** With `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`, anyone who
   can reach the port works in Zammad as the owner of `ZAMMAD_HTTP_TOKEN`. Prefer `/http/api-key/mcp`.
 - **Use a per-user token.** Give each person their own Zammad token with only the permissions they need, rather
