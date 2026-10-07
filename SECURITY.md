@@ -40,6 +40,11 @@ reasonable time to release a fix before disclosing publicly. We are happy to cre
   `ZAMMAD_HTTP_TOKEN`, with no authentication of their own. The server refuses to start in http mode with the token
   set and the flag off. Multi-user deployments should use `/http/api-key/mcp`, where each caller sends their own
   token.
+- **Platform mode does not serve the personal-token route by default.** `/http/api-key/mcp` replays the caller's
+  `X-Zammad-Token` to the internal Zammad URL, which skips the SSO proxy and the corporate-ID gate, so a leaver's or
+  leaked personal token would keep working. With `COGNITO_USER_POOL_ID` set, the route is only mounted when
+  `ZAMMAD_HTTP_API_KEY_ROUTE=true`, and the server then logs a startup warning. Do not rely on a router rule to
+  hide it instead: a path-prefix exclusion can be bypassed with an encoded path such as `/http%2Fapi-key/mcp`.
 
 ## Out of scope
 
