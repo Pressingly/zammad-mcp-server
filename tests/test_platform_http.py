@@ -95,7 +95,19 @@ def test_settings_defaults():
     assert settings.key_material == "k"
 
 
-@pytest.mark.parametrize(("raw", "expected"), [("true", True), (" TRUE ", True), ("1", True), ("false", False)])
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("true", True),
+        (" TRUE ", True),
+        ("1", True),
+        ("false", False),
+        ("ture", False),
+        ("enabled", False),
+        ("no", False),
+        ("", False),
+    ],
+)
 def test_settings_read_the_api_key_route_flag(raw, expected):
     assert PlatformSettings.from_env({**ENV, "ZAMMAD_HTTP_API_KEY_ROUTE": raw}).http_api_key_route is expected
 
