@@ -13,10 +13,10 @@ ENV UV_COMPILE_BYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
 COPY pyproject.toml uv.lock README.md LICENSE ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --extra platform --no-install-project
 
 COPY zammad_mcp/ ./zammad_mcp/
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra platform
 
 RUN groupadd --system --gid 10001 mcp \
     && useradd --system --uid 10001 --gid mcp --home-dir /app --no-create-home mcp \
