@@ -13,7 +13,11 @@ carries a per-user token (`Authorization: Token token=...`), never a shared admi
 - `zammad_mcp/client/`: the async Zammad client. It refuses cookies and raises if an `X-Auth-Request-*` header is
   about to be sent. Keep both guarantees.
 - `zammad_mcp/tools/`: one module per Zammad domain, each with `register(mcp, context)`.
-- `zammad_mcp/credentials/` (FOSS-512) and `zammad_mcp/platform/` (FOSS-513) are placeholders.
+- `zammad_mcp/credentials/`: where each request's token comes from (`ZAMMAD_HTTP_TOKEN`, or `X-Zammad-Token` on
+  `/http/api-key/mcp`). In http mode `/mcp` is only mounted with `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`. `zammad_mcp/platform/` (FOSS-513) is a placeholder.
+- `zammad_mcp/tiers.py`: the `tier:*` tags and the one `auth=` check that filters tools by tier.
+- `zammad_mcp/shaping.py`: compact output, `<untrusted_content>` framing, truncation. `confirmations.py`: two-step
+  confirm tokens.
 
 ## Commands
 
@@ -50,9 +54,14 @@ docker build --platform linux/amd64 .
 ## Tool conventions
 
 - `snake_case` verb_noun names.
-- All four `ToolAnnotations` hints on every tool; `tests/test_tools.py` enforces it.
+- Register through `context.tool(title, READ|CREATE|OVERWRITE, module=..., tier=...)`: it sets all four
+  `ToolAnnotations` hints, the `tier:*` and `module:*` tags and the tier check. `tests/test_tools.py` enforces it.
+- PUT is retried on timeouts, so a PUT body never carries an `article`; messages go through `POST /ticket_articles`.
 - Tools return an `Error: ...` string instead of raising.
-- Text written by Zammad users (titles, articles, attachments) is untrusted; wrap it as data before returning it.
+- Text written by Zammad users is untrusted: return every free-text value through `shaping.untrusted_field` or
+  `frame_untrusted`, never raw.
+- Validate responses with `Model.parse(...)` inside the tool's `try`, so an odd payload becomes an `Error:` string.
+- Agent-only arguments go through `agent_only_refusal`, which fails closed when the caller's tier is unknown.
 
 ## Commits and PRs
 

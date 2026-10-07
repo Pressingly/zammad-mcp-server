@@ -30,7 +30,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if transport == "stdio":
         mcp.run()
         return
-    uvicorn.run(build_http_app(mcp), host="0.0.0.0", port=settings.http_port, access_log=False)
+    try:
+        app = build_http_app(mcp, settings)
+    except ConfigError as error:
+        sys.exit(f"zammad-mcp: {error}")
+    uvicorn.run(app, host="0.0.0.0", port=settings.http_port, access_log=False)
 
 
 if __name__ == "__main__":

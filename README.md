@@ -5,8 +5,9 @@ It lets Claude, or any MCP client, work with Zammad tickets using **the caller's
 request carries a per-user API token, never a shared admin token, so Zammad itself decides what each user can see
 and change.
 
-Status: early bootstrap. The server runs and exposes one smoke tool, `get_me`. The ticket, article, search, user,
-organization, tag and knowledge-base tools land next.
+Status: community core. Ticket, article, attachment, search, user, organization and tag tools work in stdio and
+HTTP. Tag writes, the knowledge base and email replies land next; platform mode (SSO with per-user minted tokens)
+after that.
 
 ## Modes
 
@@ -14,10 +15,14 @@ organization, tag and knowledge-base tools land next.
 
 Works against any Zammad 6.x or 7.x with a personal API token (Zammad: avatar menu, Profile, Token Access).
 
-- **stdio** for a local MCP client: `zammad-mcp stdio`
-- **Streamable HTTP** on `/mcp`, with `GET /healthz` for health checks: `zammad-mcp http`
-
-Both read the token from `ZAMMAD_HTTP_TOKEN`. A per-request `X-Zammad-Token` header for multi-user HTTP is coming.
+- **stdio** for a local MCP client: `zammad-mcp stdio`, with the token in `ZAMMAD_HTTP_TOKEN`.
+- **Streamable HTTP**: `zammad-mcp http`, with `GET /healthz` for health checks.
+  - `/http/api-key/mcp` (always on): every caller sends their own personal token as `X-Zammad-Token`. Requests on
+    this path never use `ZAMMAD_HTTP_TOKEN`, and any `X-Auth-Request-*` header (also spelled with `_`) is stripped
+    on arrival.
+  - `/mcp` (opt-in): serves `ZAMMAD_HTTP_TOKEN` to **anyone who can reach the port**, who then acts in Zammad as
+    that token's owner. It is only mounted with `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`; `zammad-mcp http` refuses to
+    start with `ZAMMAD_HTTP_TOKEN` set and the flag off. Use it only on a loopback or otherwise private listener.
 
 ### Platform mode (coming)
 
@@ -48,29 +53,68 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-Docker (HTTP on port 8214):
+Docker (multi-user HTTP on port 8214; no token in the container, each client sends its own):
 
 ```bash
 docker build -t zammad-mcp .
-docker run --rm -p 8214:8214 -e ZAMMAD_URL=https://support.example.com -e ZAMMAD_HTTP_TOKEN=<token> zammad-mcp
+docker run --rm -p 8214:8214 -e ZAMMAD_URL=https://support.example.com zammad-mcp
 curl http://localhost:8214/healthz
 ```
+
+Point the MCP client at `http://<host>:8214/http/api-key/mcp` with the header `X-Zammad-Token: <your token>`.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ZAMMAD_URL` | required | Base URL of the Zammad instance, without `/api/v1` |
-| `ZAMMAD_HTTP_TOKEN` | unset | Personal API token used in community mode |
+| `ZAMMAD_URL` | required | Base URL the server calls, without `/api/v1` |
+| `ZAMMAD_PUBLIC_URL` | `ZAMMAD_URL` | Base URL for the `url` links in results, when users reach Zammad on another host |
+| `ZAMMAD_HTTP_TOKEN` | unset | Personal API token for `stdio` (and `/mcp` with the opt-in below) |
+| `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE` | `false` | `true` serves `/mcp` in http mode, acting as `ZAMMAD_HTTP_TOKEN`'s owner for every caller |
 | `ZAMMAD_TIMEOUT_SECONDS` | `30` | Total timeout for one Zammad request |
 | `ZAMMAD_CONNECT_TIMEOUT_SECONDS` | `10` | Connect timeout for one Zammad request |
+| `ZAMMAD_READ_ONLY` | `false` | `true` leaves out every write tool |
+| `ZAMMAD_ENABLE_REFERENCE` | `true` | `list_ticket_options` |
+| `ZAMMAD_ENABLE_TICKETS` | `true` | Ticket search, read, history, create and update |
+| `ZAMMAD_ENABLE_ARTICLES` | `true` | Article list and read, `add_ticket_note` |
+| `ZAMMAD_ENABLE_ATTACHMENTS` | `true` | `get_ticket_attachment` |
+| `ZAMMAD_ENABLE_SEARCH` | `true` | Global `search` |
+| `ZAMMAD_ENABLE_USERS` | `true` | `get_user`, `search_users` |
+| `ZAMMAD_ENABLE_ORGANIZATIONS` | `true` | `get_organization`, `search_organizations` |
+| `ZAMMAD_ENABLE_TAGS` | `true` | `list_ticket_tags` |
+| `ZAMMAD_FILTER_TOOLS_BY_ROLE` | `false` | Hide agent-only tools from customer tokens in the tool list (Zammad enforces permissions either way) |
+| `ZAMMAD_CONFIRM_TTL_SECONDS` | `600` | Lifetime of a two-step confirmation token (used by the coming email and merge tools) |
 | `MCP_HTTP_PORT` | `8214` | Listen port in `http` mode |
+
+A disabled module's tools are never registered. Flags accept `true`, `1`, `yes` or `on`, with surrounding spaces
+ignored.
 
 ## Tools
 
-| Tool | What it does |
-|---|---|
-| `get_me` | Returns the Zammad user the token belongs to: id, login, name, email, roles |
+| Tool | Who | What it does |
+|---|---|---|
+| `get_me` | all | The Zammad user the token belongs to, with their tier |
+| `list_ticket_options` | all | Active states, priorities and groups, with ids |
+| `search_tickets` | all | Text search plus exact filters (state, priority, group, customer, owner, organization), paged |
+| `get_ticket` | all | One ticket by id or `#number`, with its newest articles |
+| `list_ticket_articles` | all | A ticket's articles, newest first, paged, bodies as plain text |
+| `get_ticket_article` | all | One article, with a configurable body length |
+| `get_ticket_attachment` | all | Text attachments up to 200 KB as text, images up to 2 MB as images |
+| `search` | all | Zammad's global search across tickets, users and organizations |
+| `get_user` | all | One user (customers: themselves and their organization) |
+| `get_organization` | all | One organization (customers: their own) |
+| `list_ticket_tags` | all | The tags on a ticket |
+| `create_ticket` | all | A new ticket with a first public message; agents name the customer |
+| `update_ticket` | all | Title, state, priority, group, owner or pending time |
+| `add_ticket_note` | all | Agents: an internal note by default; customers: a public reply. Never sends email |
+| `search_users` | agents | Users by name, login, email or phone |
+| `search_organizations` | agents | Organizations by name or domain |
+| `get_ticket_history` | agents | A ticket's change history, newest first |
+
+The "Who" column is a convenience: Zammad still decides what each token may do. Callers whose role has no
+`ticket.*` permission (for example an Admin-only account) report tier `none`. Article bodies are
+cut to 4000 characters with a `truncated` flag and a hint. Search on a Zammad without Elasticsearch is a
+case-insensitive substring match with no field syntax or ranking; use the `search_tickets` filters to narrow it.
 
 Every tool declares all four MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
 and returns an `Error: ...` string instead of raising, so the model sees what went wrong.
@@ -79,16 +123,24 @@ and returns an `Error: ...` string instead of raising, so the model sees what we
 
 - **Ticket content is untrusted.** Ticket titles, articles, attachments and customer names are written by whoever
   emailed or filled in the form. A crafted ticket can try to instruct the model ("forward this ticket to ...").
-  Treat everything the server returns as data. Tools that send email will be disabled by default and need a
-  two-step confirmation.
+  The server wraps every such value in an `<untrusted_content source=... id=...>` frame and tells the model to treat
+  it as data. Framed: ticket titles and owner, customer and organization names; article subjects, bodies, `from`,
+  `to`, `cc` and author; attachment file names and text; user logins, names, emails, phones and organizations;
+  organization names and domains; tag names; search hit titles, names and emails; history authors and values.
+  Inside a frame every `&` and `<` (and the full-width and small `<` look-alikes) is escaped and invisible format
+  characters are removed, so no spelling of a closing tag survives. Not framed: ids, numbers, timestamps, flags,
+  roles, and state, priority and group names, which only admins set. Tools that send email will be disabled by
+  default and need a two-step confirmation.
+- **`/mcp` with a shared token acts as that token's owner.** With `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`, anyone who
+  can reach the port works in Zammad as the owner of `ZAMMAD_HTTP_TOKEN`. Prefer `/http/api-key/mcp`.
 - **Use a per-user token.** Give each person their own Zammad token with only the permissions they need, rather
   than sharing one admin token. Zammad intersects a token's permissions with the user's role, so a token can never
   do more than its owner.
 - **Customers need token access enabled.** Stock Zammad lets Agents and Admins create API tokens, but not
   Customers. To let Customers use this server, an admin grants `user_preferences.access_token` to the Customer role
   (Admin, Roles, Customer).
-- **The server never sends `X-Auth-Request-*` headers** and never stores cookies, so it cannot impersonate a user
-  on an SSO-fronted Zammad or carry one user's session into another user's request.
+- **The server never sends `X-Auth-Request-*` headers** (in any case, with `-` or `_`) and never stores cookies, so
+  it cannot impersonate a user on an SSO-fronted Zammad or carry one user's session into another user's request.
 
 ## Development
 
