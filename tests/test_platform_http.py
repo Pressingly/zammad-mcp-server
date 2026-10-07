@@ -263,3 +263,13 @@ def test_main_keeps_stdio_in_community_mode(monkeypatch):
     cli.main(["stdio"])
 
     assert runs == ["zammad"]
+
+
+def test_startup_warns_when_links_would_point_at_the_internal_url(caplog):
+    env = {key: value for key, value in ENV.items() if key != "ZAMMAD_URL"}
+
+    with caplog.at_level(logging.WARNING, logger="zammad_mcp"):
+        platform_http._log_startup(community_settings(env), PlatformSettings.from_env(env))
+
+    assert "point at the internal URL" in caplog.text
+    assert "MCP_ALLOWED_CLIENT_REDIRECT_URIS is unset" in caplog.text

@@ -221,6 +221,8 @@ def _log_startup(settings: Settings, platform: PlatformSettings) -> None:
         logger.warning(
             "MCP_ALLOWED_CLIENT_REDIRECT_URIS is unset: dynamic client registration accepts any redirect_uri"
         )
+    if settings.browser_url == settings.zammad_url:
+        logger.warning("ZAMMAD_PUBLIC_URL and ZAMMAD_URL are unset: links in tool results point at the internal URL")
     if not platform.storage_url:
         logger.warning(
             "MCP_OAUTH_STORAGE_URL is unset: OAuth state, minted tokens and confirmations live in this process "
