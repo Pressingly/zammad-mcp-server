@@ -64,7 +64,8 @@ def server(monkeypatch, store):
     monkeypatch.setattr(OIDCProxy, "get_oidc_configuration", lambda *_args, **_kwargs: _DISCOVERY)
 
     def build(allowlist: str) -> tuple[TestClient, object]:
-        platform = PlatformSettings.from_env({**_COGNITO_ENV, "MCP_ALLOWED_CLIENT_REDIRECT_URIS": allowlist})
+        opt_out = {"MCP_ALLOW_ANY_REDIRECT_URI": "true"} if not allowlist else {}
+        platform = PlatformSettings.from_env({**_COGNITO_ENV, "MCP_ALLOWED_CLIENT_REDIRECT_URIS": allowlist, **opt_out})
         mcp = build_platform_server(_SETTINGS, platform, store=MemoryKeyValue(), oauth_storage=store)
         return TestClient(mcp.http_app(stateless_http=True), follow_redirects=False), mcp.auth
 

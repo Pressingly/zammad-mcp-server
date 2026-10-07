@@ -39,6 +39,7 @@ ENV = {
     "ZAMMAD_INTERNAL_BASE_URL": "http://zammad-nginx:8080/",
     "ZAMMAD_URL": "https://support.example.test",
     "DEFAULT_EMAIL_DOMAIN": "AskII.ai",
+    "MCP_ALLOWED_CLIENT_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
 }
 
 
@@ -82,7 +83,7 @@ def test_settings_defaults():
     )
 
     assert settings.scopes == ("openid",)
-    assert settings.redirect_allowlist is None
+    assert settings.redirect_allowlist == ["https://claude.ai/api/mcp/auth_callback"]
     assert settings.access_token_ttl_seconds == DEFAULT_ACCESS_TOKEN_TTL_SECONDS
     assert settings.cors_origins == ("*",)
     assert settings.log_level == "INFO"
@@ -98,6 +99,14 @@ def test_settings_defaults():
         ({"ZAMMAD_HTTP_TOKEN": "shared"}, "never uses a shared token"),
         ({"ZAMMAD_HTTP_SHARED_TOKEN_ROUTE": "true"}, "never uses a shared token"),
         ({"MCP_ACCESS_TOKEN_TTL_SECONDS": "0"}, "at least 1"),
+        ({"MCP_ALLOWED_CLIENT_REDIRECT_URIS": ""}, "MCP_ALLOW_ANY_REDIRECT_URI=true"),
+        ({"MCP_ALLOWED_CLIENT_REDIRECT_URIS": " , "}, "MCP_ALLOW_ANY_REDIRECT_URI=true"),
+        ({"MCP_ALLOWED_CLIENT_REDIRECT_URIS": "", "MCP_ALLOW_ANY_REDIRECT_URI": "false"}, "is empty"),
+        ({"DEFAULT_EMAIL_DOMAIN": "user@askii.ai"}, "bare domain"),
+        ({"DEFAULT_EMAIL_DOMAIN": "https://askii.ai"}, "bare domain"),
+        ({"DEFAULT_EMAIL_DOMAIN": "askii.ai."}, "bare domain"),
+        ({"DEFAULT_EMAIL_DOMAIN": "askii.ai/x"}, "bare domain"),
+        ({"DEFAULT_EMAIL_DOMAIN": "-askii.ai"}, "bare domain"),
     ],
 )
 def test_settings_refuse_an_unsafe_or_incomplete_env(overrides, message):
@@ -266,10 +275,46 @@ def test_main_keeps_stdio_in_community_mode(monkeypatch):
 
 
 def test_startup_warns_when_links_would_point_at_the_internal_url(caplog):
-    env = {key: value for key, value in ENV.items() if key != "ZAMMAD_URL"}
+    env = {
+        **{key: value for key, value in ENV.items() if key not in ("ZAMMAD_URL", "MCP_ALLOWED_CLIENT_REDIRECT_URIS")},
+        "MCP_ALLOW_ANY_REDIRECT_URI": "true",
+    }
 
     with caplog.at_level(logging.WARNING, logger="zammad_mcp"):
         platform_http._log_startup(community_settings(env), PlatformSettings.from_env(env))
 
     assert "point at the internal URL" in caplog.text
-    assert "MCP_ALLOWED_CLIENT_REDIRECT_URIS is unset" in caplog.text
+    assert "accepts any redirect_uri" in caplog.text
+
+
+def test_an_unset_allowlist_refuses_to_start():
+    env = {key: value for key, value in ENV.items() if key != "MCP_ALLOWED_CLIENT_REDIRECT_URIS"}
+
+    with pytest.raises(ConfigError, match="MCP_ALLOWED_CLIENT_REDIRECT_URIS is empty"):
+        PlatformSettings.from_env(env)
+
+
+def test_the_explicit_opt_out_starts_with_a_warning(caplog):
+    env = {**ENV, "MCP_ALLOWED_CLIENT_REDIRECT_URIS": "", "MCP_ALLOW_ANY_REDIRECT_URI": "true"}
+
+    settings = PlatformSettings.from_env(env)
+    with caplog.at_level(logging.WARNING, logger="zammad_mcp"):
+        platform_http._log_startup(community_settings(env), settings)
+
+    assert settings.redirect_allowlist is None
+    assert "accepts any redirect_uri" in caplog.text
+
+
+@pytest.mark.parametrize("domain", ["askii.ai", "mail.example.co.uk", "localhost", "a-b.example"])
+def test_bare_domains_are_accepted(domain):
+    assert PlatformSettings.from_env({**ENV, "DEFAULT_EMAIL_DOMAIN": domain.upper()}).default_email_domain == domain
+
+
+def test_the_namespace_separates_deployments_sharing_one_valkey():
+    first = PlatformSettings.from_env(ENV)
+    second = PlatformSettings.from_env({**ENV, "ZAMMAD_INTERNAL_BASE_URL": "http://other-zammad:8080"})
+    third = PlatformSettings.from_env({**ENV, "OIDC_CLIENT_ID": "other-client"})
+
+    assert len(first.namespace) == 12
+    assert len({first.namespace, second.namespace, third.namespace}) == 3
+    assert first.namespace == PlatformSettings.from_env(ENV).namespace

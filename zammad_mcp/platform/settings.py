@@ -9,8 +9,10 @@ which rejects API tokens.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -31,6 +33,8 @@ REQUIRED = (
     "ZAMMAD_INTERNAL_BASE_URL",
     "DEFAULT_EMAIL_DOMAIN",
 )
+HOSTNAME = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+NAMESPACE_LENGTH = 12
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -65,6 +69,7 @@ class PlatformSettings:
     storage_url: str = field(default="", repr=False)
     scopes: tuple[str, ...] = DEFAULT_SCOPES
     allowed_redirect_uris: tuple[str, ...] = ()
+    allow_any_redirect_uri: bool = False
     access_token_ttl_seconds: int = DEFAULT_ACCESS_TOKEN_TTL_SECONDS
     upstream_auth_url: str = ""
     upstream_token_url: str = ""
@@ -81,8 +86,13 @@ class PlatformSettings:
 
     @property
     def redirect_allowlist(self) -> list[str] | None:
-        """``None`` lets dynamic client registration accept any redirect URI."""
+        """``None`` (only with the explicit opt-out) lets client registration accept any redirect URI."""
         return list(self.allowed_redirect_uris) or None
+
+    @property
+    def namespace(self) -> str:
+        """Separates two deployments that share one Valkey database."""
+        return hashlib.sha256(f"{self.client_id}|{self.internal_url}".encode()).hexdigest()[:NAMESPACE_LENGTH]
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> PlatformSettings:
@@ -98,6 +108,20 @@ class PlatformSettings:
             raise ConfigError(
                 "platform mode never uses a shared token: unset ZAMMAD_HTTP_TOKEN and ZAMMAD_HTTP_SHARED_TOKEN_ROUTE"
             )
+        allowed_redirect_uris = _split(_read(env, "MCP_ALLOWED_CLIENT_REDIRECT_URIS"))
+        allow_any_redirect_uri = env_flag("MCP_ALLOW_ANY_REDIRECT_URI", environ=env)
+        if not allowed_redirect_uris and not allow_any_redirect_uri:
+            raise ConfigError(
+                "MCP_ALLOWED_CLIENT_REDIRECT_URIS is empty: set the redirect URIs MCP clients may register "
+                "(e.g. https://claude.ai/api/mcp/auth_callback,http://localhost:*/*), or set "
+                "MCP_ALLOW_ANY_REDIRECT_URI=true to accept any"
+            )
+        default_email_domain = _read(env, "DEFAULT_EMAIL_DOMAIN").lower()
+        if not HOSTNAME.match(default_email_domain):
+            raise ConfigError(
+                f"DEFAULT_EMAIL_DOMAIN={default_email_domain!r} must be a bare domain such as askii.ai "
+                "(no @, scheme, path or trailing dot)"
+            )
         log_level = _read(env, "MCP_LOG_LEVEL").upper()
         return cls(
             base_url=_read(env, "MCP_BASE_URL").rstrip("/"),
@@ -105,12 +129,13 @@ class PlatformSettings:
             aws_region=_read(env, "COGNITO_AWS_REGION"),
             client_id=_read(env, "OIDC_CLIENT_ID"),
             internal_url=_read(env, "ZAMMAD_INTERNAL_BASE_URL").rstrip("/"),
-            default_email_domain=_read(env, "DEFAULT_EMAIL_DOMAIN").lower(),
+            default_email_domain=default_email_domain,
             client_secret=_read(env, "OIDC_CLIENT_SECRET"),
             jwt_signing_key=_read(env, "MCP_JWT_SIGNING_KEY"),
             storage_url=_read(env, "MCP_OAUTH_STORAGE_URL"),
             scopes=_split(_read(env, "MCP_OIDC_SCOPES"), on_spaces=True) or DEFAULT_SCOPES,
-            allowed_redirect_uris=_split(_read(env, "MCP_ALLOWED_CLIENT_REDIRECT_URIS")),
+            allowed_redirect_uris=allowed_redirect_uris,
+            allow_any_redirect_uri=allow_any_redirect_uri,
             access_token_ttl_seconds=_positive_int(
                 env, "MCP_ACCESS_TOKEN_TTL_SECONDS", DEFAULT_ACCESS_TOKEN_TTL_SECONDS
             ),
