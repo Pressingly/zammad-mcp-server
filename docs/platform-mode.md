@@ -14,11 +14,23 @@ it) and set `COGNITO_USER_POOL_ID`; `zammad-mcp http` then runs platform mode. `
 |---|---|---|
 | `/mcp` | FastMCP's Cognito provider (OAuth 2.0 with dynamic client registration and RFC 8414/9728 discovery) | The caller's minted token |
 | `/authorize`, `/auth/callback`, `/token`, `/register`, `/.well-known/*` | Public OAuth endpoints | n/a |
-| `/http/api-key/mcp` | None at the MCP layer | The caller's own `X-Zammad-Token`; `X-Auth-Request-*` headers are stripped |
+| `/http/api-key/mcp` | None at the MCP layer; **only mounted with `ZAMMAD_HTTP_API_KEY_ROUTE=true`** | The caller's own `X-Zammad-Token`; `X-Auth-Request-*` headers are stripped |
 | `/healthz` | None | n/a |
 
 Register `<MCP_BASE_URL>/auth/callback` as a callback URL on the Cognito app client. The router in front of the
 server must not add an SSO ForwardAuth to these paths: the Cognito provider is the only auth layer on `/mcp`.
+
+### The personal-token route is off by default
+
+`/http/api-key/mcp` sends whatever `X-Zammad-Token` the caller supplies to `ZAMMAD_INTERNAL_BASE_URL`. That URL is
+deliberately not behind the SSO proxy, so the request skips mPass/oauth2-proxy and the corporate-ID gate: a
+personal token that belongs to a leaver, or one that leaked, keeps working from anywhere that reaches this server.
+In platform mode the route is therefore not mounted at all, and startup logs one line saying so. Requests to it,
+including encoded spellings such as `/http%2Fapi-key/mcp`, fall through to the OAuth app and get a 404.
+
+Set `ZAMMAD_HTTP_API_KEY_ROUTE=true` only for a deployment that accepts that bypass; startup then logs a WARNING.
+A router rule that excludes the path is defence in depth, not the control: a `PathPrefix` exclusion is bypassed by
+`/http%2Fapi-key/mcp`, because the router matches the encoded path while the server decodes it before routing.
 
 ## How a token is minted
 
@@ -144,6 +156,7 @@ between replicas.
 | `MCP_ENV` | | `production` adds a note to the warning when storage is in process |
 | `ZAMMAD_SSO_EMAIL_HEADER` | `X-Auth-Request-Email` | Identity header the SSO middleware trusts, for other deployments |
 | `ZAMMAD_SSO_ACCESS_TOKEN_HEADER` | `X-Auth-Request-Access-Token` | Access-token header for a corporate-ID gate |
+| `ZAMMAD_HTTP_API_KEY_ROUTE` | `false` | `true` mounts `/http/api-key/mcp` for personal tokens, which bypasses the SSO proxy and the corporate-ID gate; logs a WARNING at startup |
 
 The refresh lifetime falls back to 30 days, since Cognito sends no `refresh_expires_in`. The community settings
 (`ZAMMAD_ENABLE_*`, `ZAMMAD_READ_ONLY`, timeouts, `MCP_HTTP_PORT`) apply as usual. `ZAMMAD_HTTP_TOKEN` and
@@ -156,3 +169,5 @@ The refresh lifetime falls back to 30 days, since Cognito sends no `refresh_expi
 - Any container on the internal network can send `X-Auth-Request-Email` to Zammad directly. That exposure exists
   without this server; keep the internal URL off untrusted networks.
 - Logs never contain tokens, cookies, CSRF tokens or bodies; cache keys are hashes of the identity.
+- `/http/api-key/mcp` is not served unless `ZAMMAD_HTTP_API_KEY_ROUTE=true`; see
+  [the personal-token route](#the-personal-token-route-is-off-by-default).

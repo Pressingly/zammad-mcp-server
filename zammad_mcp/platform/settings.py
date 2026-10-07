@@ -78,6 +78,7 @@ class PlatformSettings:
     email_header: str = DEFAULT_EMAIL_HEADER
     access_token_header: str = DEFAULT_ACCESS_TOKEN_HEADER
     production: bool = False
+    http_api_key_route: bool = False
 
     @property
     def key_material(self) -> str:
@@ -146,6 +147,7 @@ class PlatformSettings:
             email_header=_read(env, "ZAMMAD_SSO_EMAIL_HEADER") or DEFAULT_EMAIL_HEADER,
             access_token_header=_read(env, "ZAMMAD_SSO_ACCESS_TOKEN_HEADER") or DEFAULT_ACCESS_TOKEN_HEADER,
             production=_read(env, "MCP_ENV").lower() == "production",
+            http_api_key_route=env_flag("ZAMMAD_HTTP_API_KEY_ROUTE", environ=env),
         )
 
 

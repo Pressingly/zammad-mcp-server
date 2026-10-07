@@ -32,7 +32,10 @@ each user, bounded by that user's Zammad role. It needs the optional `[platform]
 image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it.
 
 - `/mcp` is guarded by FastMCP's Cognito provider (OAuth 2.0 with dynamic client registration); every call runs
-  with the caller's minted token. `/http/api-key/mcp` stays available for personal tokens.
+  with the caller's minted token.
+- `/http/api-key/mcp` is **not mounted** unless `ZAMMAD_HTTP_API_KEY_ROUTE=true`. It would replay any caller's
+  personal `X-Zammad-Token` to the internal Zammad, past the SSO proxy and the corporate-ID gate, so a leaver's or
+  leaked token would keep working from the internet. Turning it on logs a startup warning.
 - A token carries an explicit list: `ticket.agent`, `ticket.customer`, `knowledge_base.reader` and
   `knowledge_base.editor`, intersected with the user's role. Never `admin.*`, `report` or `user_preferences.*`.
 - Tokens last about 8 days, are cached for 6 (Fernet-encrypted in Valkey), are re-checked every 4 hours and
@@ -60,6 +63,7 @@ image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it
 | `MCP_ACCESS_TOKEN_TTL_SECONDS` | `86400` | Lifetime of the token issued to the MCP client |
 | `MCP_OIDC_SCOPES` | `openid` | Upstream scopes |
 | `MCP_LOG_LEVEL` | `INFO` | JSON log level |
+| `ZAMMAD_HTTP_API_KEY_ROUTE` | `false` | `true` also serves `/http/api-key/mcp` for personal tokens, bypassing the SSO proxy and corporate-ID gate (startup warning). Platform mode only; community mode always serves it |
 
 See [docs/platform-mode.md](docs/platform-mode.md) for the mint flow, the cache and every setting.
 
