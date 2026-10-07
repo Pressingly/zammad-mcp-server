@@ -89,6 +89,7 @@ class Article(ZammadModel):
     created_by_id: int | None = None
     origin_by_id: int | None = None
     created_at: str | None = None
+    preferences: dict[str, Any] = Field(default_factory=dict)
     attachments: list[Attachment] = Field(default_factory=list)
 
 

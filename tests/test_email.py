@@ -66,6 +66,28 @@ AGENT_ARTICLE = {
     "from": "Support <support@example.com>",
     "to": "cara@example.com",
     "cc": "Boss <boss@example.com>",
+    "preferences": {"email_address_id": 3},
+}
+SPOOFED_AGENT_EMAIL = {
+    "id": 7,
+    "ticket_id": 4,
+    "sender": "Agent",
+    "type": "email",
+    "internal": False,
+    "created_by_id": 1,
+    "from": "Support <support@example.com>",
+    "to": "support@example.com",
+    "cc": "insider@evil.test",
+    "preferences": {"send-auto-response": False},
+}
+AGENT_PHONE_NOTE = {
+    "id": 8,
+    "ticket_id": 4,
+    "sender": "Agent",
+    "type": "phone",
+    "internal": False,
+    "created_by_id": 7,
+    "to": "Field Tech <tech@example.com>",
 }
 INTERNAL_NOTE = {
     "id": 3,
@@ -96,7 +118,15 @@ SYSTEM_NOTICE = {
     "internal": False,
     "to": "notify-list@example.com",
 }
-ARTICLES = [CUSTOMER_ARTICLE, AGENT_ARTICLE, INTERNAL_NOTE, OUTSIDER_FOLLOW_UP, SYSTEM_NOTICE]
+ARTICLES = [
+    CUSTOMER_ARTICLE,
+    AGENT_ARTICLE,
+    INTERNAL_NOTE,
+    OUTSIDER_FOLLOW_UP,
+    SYSTEM_NOTICE,
+    SPOOFED_AGENT_EMAIL,
+    AGENT_PHONE_NOTE,
+]
 CREATED = {"id": 50, "ticket_id": 4, "type": "email", "sender": "Agent", "internal": False}
 PREPARED = {"ticket_id": 4, "subject": "Re: printer", "body": "We are on it. SECRET-BODY-TEXT"}
 STRAY_SEND = {"confirmation_token": "t", "to": ["a@b.test"], "subject": "s"}
@@ -299,8 +329,8 @@ async def test_attachments_are_previewed_and_posted(email_settings, zammad):
 
 @pytest.mark.parametrize(
     "address",
-    ["cara-replies@example.com", "colleague@example.com", "boss@example.com"],
-    ids=["customer-reply-to", "customer-cc", "agent-cc"],
+    ["cara-replies@example.com", "colleague@example.com", "boss@example.com", "tech@example.com"],
+    ids=["customer-reply-to", "customer-cc", "agent-email-cc", "agent-phone-to"],
 )
 async def test_customer_and_agent_articles_add_participants(email_settings, zammad, address):
     preview = await prepare(email_settings, zammad, to=[address])
@@ -318,8 +348,9 @@ async def test_customer_and_agent_articles_add_participants(email_settings, zamm
         "accomplice@evil.test",
         "secret-partner@example.com",
         "notify-list@example.com",
+        "insider@evil.test",
     ],
-    ids=["outsider-from", "outsider-reply-to", "outsider-cc", "internal-note", "system-article"],
+    ids=["outsider-from", "outsider-reply-to", "outsider-cc", "internal-note", "system-article", "spoofed-agent"],
 )
 async def test_outsider_and_internal_articles_add_no_participants(email_settings, zammad, address):
     shaped = await prepare(email_settings, zammad, to=[address])
@@ -435,11 +466,25 @@ async def test_malformed_recipients_are_refused(email_settings, zammad, value):
     assert shaped == f"Error: {value!r} is not one plain email address (name@example.com)"
 
 
-@pytest.mark.parametrize("subject", ["Re: printer\r\nBcc: x@evil.test", "Re:\nprinter", "Re: printer", "a\tb"])
-async def test_subject_with_control_characters_is_refused(email_settings, zammad, subject):
+@pytest.mark.parametrize(
+    "subject",
+    ["Re: printer\r\nBcc: x@evil.test", "Re:\nprinter", "Re: printer", "a\tb", "Re: ‮gpj.exe", "⁦x⁩"],
+    ids=["crlf", "lf", "line-separator", "tab", "rlo", "lri-pdi"],
+)
+async def test_subject_with_control_characters_or_bidi_overrides_is_refused(email_settings, zammad, subject):
     shaped = await prepare(email_settings, zammad, subject=subject)
-    assert shaped == "Error: the subject must be one line without control characters"
+    assert shaped == "Error: the subject must be one line without control characters or bidi overrides"
     assert zammad.calls("GET", "/tickets/4") == []
+
+
+@pytest.mark.parametrize(
+    "subject",
+    ["Family \U0001f468‍\U0001f469‍\U0001f467 update", "‏שלום, the printer", "‎مرحبا"],
+    ids=["zwj-emoji", "rlm-hebrew", "lrm-arabic"],
+)
+async def test_subjects_with_emoji_joiners_and_direction_marks_pass(email_settings, zammad, subject):
+    preview = await prepare(email_settings, zammad, subject=subject)
+    assert preview["subject"] == subject
 
 
 # --- preflight ---

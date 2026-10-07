@@ -61,7 +61,8 @@ MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ATTACHMENT_DATA_CHARS = 4 * MAX_ATTACHMENT_BYTES // 3 + 4
 MAX_ATTACHMENTS = 20
 MAX_EMAIL_BODY_CHARS = 1_000_000
-_LINE_BREAKING = frozenset({"Cc", "Cf", "Zl", "Zp"})
+_LINE_BREAKING_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+_BIDI_OVERRIDES = frozenset(chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
 EXPAND = {"expand": "true"}
 _ADDRESS = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 
@@ -117,11 +118,24 @@ def is_customer_article(article: Article, ticket: Ticket, customer: str | None) 
     return customer is not None and customer in parse_addresses([article.from_])
 
 
+def is_agent_article(article: Article) -> bool:
+    """An article an agent really wrote.
+
+    Zammad marks inbound mail whose From is one of its own addresses as sent
+    by an Agent, so an outsider can forge that. Only mail Zammad sent itself
+    carries ``preferences.email_address_id``, so an Agent email counts only
+    with it. Agent notes, phone and web articles are created inside Zammad.
+    """
+    if article.sender != "Agent":
+        return False
+    return article.type != "email" or bool(article.preferences.get("email_address_id"))
+
+
 def participant_lines(article: Article, ticket: Ticket, customer: str | None) -> tuple[str | None, ...]:
     """The address lines one article vouches for: agents' and the customer's public articles only."""
     if article.internal:
         return ()
-    if article.sender == "Agent":
+    if is_agent_article(article):
         return (article.from_, article.to, article.cc)
     if is_customer_article(article, ticket, customer):
         return (article.from_, article.to, article.cc, article.reply_to)
@@ -168,10 +182,19 @@ def recipient_warnings(recipients: list[str], customer: str | None) -> list[str]
     ]
 
 
+def is_forbidden_in_subject(char: str) -> bool:
+    """Line breaks and control characters, and the bidi embeddings and overrides that can disguise text.
+
+    Other format characters stay allowed: emoji need ZWJ, and Arabic and
+    Hebrew subjects need the LRM and RLM marks.
+    """
+    return unicodedata.category(char) in _LINE_BREAKING_CATEGORIES or char in _BIDI_OVERRIDES
+
+
 def check_subject(subject: str) -> str:
     text = subject.strip()
-    if any(unicodedata.category(char) in _LINE_BREAKING for char in text):
-        raise EmailReplyError("the subject must be one line without control characters")
+    if any(is_forbidden_in_subject(char) for char in text):
+        raise EmailReplyError("the subject must be one line without control characters or bidi overrides")
     return text
 
 
