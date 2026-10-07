@@ -56,7 +56,8 @@ docker build --platform linux/amd64 .
 ## Tool conventions
 
 - `snake_case` verb_noun names.
-- Register through `context.tool(title, READ|CREATE|OVERWRITE, module=..., tier=...)`: it sets all four
+- Register through `context.tool(title, <spec>, module=..., tier=...)` with a spec from `tools/context.py`
+  (`READ`, `CREATE`, `ADD`, `OVERWRITE`, `PREPARE`, `IRREVERSIBLE`): it sets all four
   `ToolAnnotations` hints, the `tier:*` and `module:*` tags and the tier check. `tests/test_tools.py` enforces it.
 - PUT is retried on timeouts, so a PUT body never carries an `article`; messages go through `POST /ticket_articles`.
 - Tools return an `Error: ...` string instead of raising.
@@ -64,6 +65,8 @@ docker build --platform linux/amd64 .
   `frame_untrusted`, never raw.
 - Validate responses with `Model.parse(...)` inside the tool's `try`, so an odd payload becomes an `Error:` string.
 - Agent-only arguments go through `agent_only_refusal`, which fails closed when the caller's tier is unknown.
+- Actions that leave Zammad or change many tickets (email, macros) are a `prepare_*` tool plus a confirming tool,
+  through `context.confirmations`, and their module is off by default.
 
 ## Commits and PRs
 

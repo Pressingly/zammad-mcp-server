@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from fastmcp import Client
 from starlette.testclient import TestClient
+
+from zammad_mcp.server import build_server
+
+if TYPE_CHECKING:
+    import httpx
+
+    from zammad_mcp.config import Settings
 
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
@@ -40,3 +48,20 @@ def unframed(value: Any) -> Any:
         match = _FRAME.match(value)
         return match.group(1) if match else value
     return value
+
+
+async def tools(settings: Settings, fake: httpx.AsyncBaseTransport) -> dict[str, Any]:
+    """The registered tools by name, as an MCP client lists them."""
+    async with Client(build_server(settings, transport=fake)) as client:
+        return {tool.name: tool for tool in await client.list_tools()}
+
+
+async def call(settings: Settings, fake: httpx.AsyncBaseTransport, name: str, arguments: dict[str, Any] | None = None):
+    async with Client(build_server(settings, transport=fake)) as client:
+        return await client.call_tool(name, arguments or {})
+
+
+async def data(
+    settings: Settings, fake: httpx.AsyncBaseTransport, name: str, arguments: dict[str, Any] | None = None
+) -> Any:
+    return (await call(settings, fake, name, arguments)).data
