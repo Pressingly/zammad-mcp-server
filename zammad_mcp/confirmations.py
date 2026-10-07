@@ -25,8 +25,10 @@ Bounds, all raised as :class:`ConfirmationLimitError`:
 
 Sizes are UTF-8 bytes of the stored JSON, which keeps non-ASCII text as is.
 
-The backend is a two-method protocol: :class:`MemoryConfirmationBackend` now,
-a Valkey one later (``SET key value EX ttl`` and ``GETDEL key``).
+The backend is a two-method protocol: :class:`MemoryConfirmationBackend`, and in
+platform mode ``zammad_mcp.platform.storage.ValkeyConfirmationBackend``
+(``SET key value EX ttl`` and ``GETDEL key``, Fernet-encrypted, with the same
+global byte cap). The per-identity limits above are kept in each process.
 """
 
 from __future__ import annotations

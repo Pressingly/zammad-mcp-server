@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -24,8 +25,9 @@ from starlette.routing import Mount, Route
 
 from zammad_mcp.client import ZammadClient
 from zammad_mcp.config import Settings
-from zammad_mcp.confirmations import Confirmations, MemoryConfirmationBackend
+from zammad_mcp.confirmations import ConfirmationBackend, Confirmations, MemoryConfirmationBackend
 from zammad_mcp.credentials import (
+    CredentialProvider,
     HeaderCredentialProvider,
     MountRoutedCredentialProvider,
     StaticCredentialProvider,
@@ -52,15 +54,20 @@ def build_server(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     tier_resolver: TierResolver | None = None,
+    client: ZammadClient | None = None,
+    credentials: CredentialProvider | None = None,
+    confirmation_backend: ConfirmationBackend | None = None,
+    auth: AuthProvider | None = None,
 ) -> FastMCP:
-    client = ZammadClient(
+    """Build the community server; platform mode passes its own client, credentials, storage and auth."""
+    client = client or ZammadClient(
         settings.api_base_url,
         timeout_seconds=settings.timeout_seconds,
         connect_timeout_seconds=settings.connect_timeout_seconds,
         transport=transport,
     )
     static = StaticCredentialProvider(client, settings.http_token)
-    credentials = MountRoutedCredentialProvider(default=static, api_key=HeaderCredentialProvider(client))
+    credentials = credentials or MountRoutedCredentialProvider(default=static, api_key=HeaderCredentialProvider(client))
     resolver = tier_resolver or community_tier_resolver(credentials, filter_by_role=settings.filter_tools_by_role)
 
     @asynccontextmanager
@@ -76,10 +83,12 @@ def build_server(
         credentials=credentials,
         links=Links(settings.browser_url),
         tier_check=require_tier(resolver),
-        confirmations=Confirmations(MemoryConfirmationBackend(), ttl_seconds=settings.confirm_ttl_seconds),
+        confirmations=Confirmations(
+            confirmation_backend or MemoryConfirmationBackend(), ttl_seconds=settings.confirm_ttl_seconds
+        ),
         read_only=settings.read_only,
     )
-    mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, lifespan=lifespan)
+    mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, lifespan=lifespan, auth=auth)
     register_tools(mcp, context, settings)
     return mcp
 

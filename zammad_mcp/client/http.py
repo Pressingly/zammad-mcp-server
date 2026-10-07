@@ -16,6 +16,10 @@
   (``ConnectError``, ``ConnectTimeout``, ``PoolTimeout``), so an article or
   email is never posted twice. A 429 is retried once for
   every method, after ``Retry-After``, because Zammad did not process it.
+- An optional ``on_rejected`` hook sees every 401 and 403. When it returns a
+  different token the request is sent once more with it (a 401 means Zammad
+  did not process the request, so this is safe for POST too). Platform mode
+  uses it to re-mint an expired or revoked per-user token.
 """
 
 from __future__ import annotations
@@ -30,10 +34,12 @@ from typing import Any
 import httpx
 
 from zammad_mcp.client.errors import (
+    AuthError,
     ContentTooLargeError,
     IdentityHeaderError,
     InvalidTokenError,
     MissingTokenError,
+    PermissionDenied,
     ServerError,
     ZammadAPIError,
     ZammadError,
@@ -51,6 +57,7 @@ PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 IN_FLIGHT_ERRORS = (httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.RemoteProtocolError)
 
 Sleep = Callable[[float], Awaitable[None]]
+RejectionHook = Callable[[ZammadAPIError, str], Awaitable[str | None]]
 
 
 @dataclass(frozen=True)
@@ -167,6 +174,7 @@ class ZammadClient:
         retry: RetryPolicy | None = None,
         sleep: Sleep | None = None,
         rng: random.Random | None = None,
+        on_rejected: RejectionHook | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds)
@@ -174,6 +182,7 @@ class ZammadClient:
         self._retry = retry or RetryPolicy()
         self._sleep = sleep or asyncio.sleep
         self._rng = rng or random.Random()
+        self._on_rejected = on_rejected
         self._http: httpx.AsyncClient | None = None
 
     def _client(self) -> httpx.AsyncClient:
@@ -241,7 +250,16 @@ class ZammadClient:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    async def _send(
+    async def _send(self, method: str, path: str, *, token: str | None, **options: Any) -> httpx.Response:
+        try:
+            return await self._attempt(method, path, token=token, **options)
+        except (AuthError, PermissionDenied) as error:
+            replacement = await self._on_rejected(error, token) if self._on_rejected and token else None
+            if not replacement or replacement == token:
+                raise
+        return await self._attempt(method, path, token=replacement, **options)
+
+    async def _attempt(
         self,
         method: str,
         path: str,
