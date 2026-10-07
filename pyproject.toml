@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 platform = [
+    "anyio>=4",
     "redis>=5",
     "cryptography",
     "pyjwt>=2",

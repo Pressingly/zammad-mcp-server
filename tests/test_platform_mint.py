@@ -7,6 +7,7 @@ import json
 import logging
 from datetime import UTC, date, datetime, timedelta
 
+import anyio
 import httpx
 import pytest
 
@@ -775,3 +776,53 @@ async def test_another_users_synthetic_address_is_refused(minter, zammad):
         await minter.token_for(victim)
 
     assert zammad.requests == []
+
+
+async def test_a_cancelled_bootstrap_still_signs_out(store, clock):
+    posted = asyncio.Event()
+    signouts: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/signout"):
+            await asyncio.sleep(0)
+            signouts.append(request)
+            return httpx.Response(200, json={})
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"tokens": [], "permissions": ["ticket.agent"]},
+                headers={"set-cookie": f"{COOKIE_NAME}=held; secure", "csrf-token": "c"},
+            )
+        posted.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    minter = make_minter(httpx.MockTransport(handler), store, clock)
+    async with anyio.create_task_group() as group:
+        group.start_soon(minter.token_for, identity(AGENT))
+        await posted.wait()
+        group.cancel_scope.cancel()
+
+    (signout,) = signouts
+    assert signout.headers["cookie"] == f"{COOKIE_NAME}=held"
+
+
+async def test_a_hanging_signout_gives_up(store, clock, monkeypatch):
+    monkeypatch.setattr("zammad_mcp.platform.mint.SIGNOUT_TIMEOUT_SECONDS", 0.01)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/signout"):
+            await asyncio.Event().wait()
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"tokens": [], "permissions": ["ticket.agent"]},
+                headers={"set-cookie": f"{COOKIE_NAME}=s; secure", "csrf-token": "c"},
+            )
+        return httpx.Response(200, json={"token": "ok"})
+
+    minted = await asyncio.wait_for(
+        make_minter(httpx.MockTransport(handler), store, clock).token_for(identity(AGENT)), 2
+    )
+
+    assert minted.token == "ok"

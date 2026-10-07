@@ -1660,6 +1660,7 @@ dependencies = [
 
 [package.optional-dependencies]
 platform = [
+    { name = "anyio" },
     { name = "authlib" },
     { name = "cryptography" },
     { name = "py-key-value-aio", extra = ["redis"] },
@@ -1678,6 +1679,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", marker = "extra == 'platform'", specifier = ">=4" },
     { name = "authlib", marker = "extra == 'platform'", specifier = ">=1.6.9" },
     { name = "cryptography", marker = "extra == 'platform'" },
     { name = "fastmcp", specifier = "==3.4.7" },

@@ -15,10 +15,11 @@ httpx client of its own and the internal Zammad URL:
    copied by hand into a ``Cookie`` header.
 4. Best effort: delete this user's own *expired* ``zammad-mcp`` tokens.
    A live token is never revoked, since another replica may be using it.
-5. Always, even when a step failed: ``DELETE /signout`` with the session
-   cookie. The middleware made a persistent web session with the user's full
-   role; signing out deletes its row instead of leaving it for Zammad's
-   four-week session reaper.
+5. Always, even when a step failed or the request was cancelled (shielded,
+   for at most five seconds): ``DELETE /signout`` with the session cookie.
+   The middleware made a persistent web session with the user's full role;
+   signing out deletes its row instead of leaving it for Zammad's four-week
+   session reaper.
 
 Every bootstrap request sends the same ``X-Browser-Fingerprint`` and
 ``User-Agent`` (the steady-state client's), so Zammad records one device
@@ -50,6 +51,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import anyio
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -90,6 +92,7 @@ RECHECK_DUE_KEY_PREFIX = "zammad-mcp:recheck-due:v1:"
 CACHE_SALT = "zammad-mcp-token-cache"
 SESSION_COOKIE_PREFIX = "_zammad_session_"
 SIGNOUT_PATH = "/signout"
+SIGNOUT_TIMEOUT_SECONDS = 5.0
 DEFAULT_NAMESPACE = "local"
 CUSTOMER_TOKEN_ACCESS_DENIED = "user authorization failed."
 DEFAULT_EMAIL_HEADER = "X-Auth-Request-Email"
@@ -474,7 +477,8 @@ class TokenEndpoint:
             try:
                 yield session
             finally:
-                await session.sign_out()
+                with anyio.CancelScope(shield=True), anyio.move_on_after(SIGNOUT_TIMEOUT_SECONDS):
+                    await session.sign_out()
 
 
 class KeyedLocks:
