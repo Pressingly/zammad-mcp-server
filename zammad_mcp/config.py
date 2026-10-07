@@ -15,7 +15,7 @@ from zammad_mcp.env_flags import env_flag
 
 DEFAULT_HTTP_PORT = 8214
 DEFAULT_CONFIRM_TTL_SECONDS = 600
-TOOL_MODULES = ("reference", "tickets", "articles", "attachments", "search", "users", "organizations", "tags")
+TOOL_MODULES = ("reference", "tickets", "articles", "attachments", "search", "users", "organizations", "tags", "kb")
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 

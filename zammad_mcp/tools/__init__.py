@@ -20,6 +20,7 @@ from zammad_mcp.config import Settings
 from zammad_mcp.tools import (
     articles,
     attachments,
+    kb,
     me,
     organizations,
     reference,
@@ -41,6 +42,7 @@ MODULES: dict[str, ModuleType] = {
     "users": users,
     "organizations": organizations,
     "tags": tags,
+    "kb": kb,
 }
 
 

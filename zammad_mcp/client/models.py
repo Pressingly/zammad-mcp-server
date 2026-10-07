@@ -117,3 +117,37 @@ class Role(ZammadModel):
     id: int
     name: str | None = None
     permissions: list[str] = Field(default_factory=list)
+
+
+class KnowledgeBaseHit(ZammadModel):
+    """One ``details`` row of ``POST /knowledge_bases/search``; ``id`` is the answer translation's id."""
+
+    id: int
+    type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    body: str | None = None
+    date: str | None = None
+
+
+class KnowledgeBaseAnswer(ZammadModel):
+    id: int
+    category_id: int | None = None
+    translation_ids: list[int] = Field(default_factory=list)
+    published_at: str | None = None
+    internal_at: str | None = None
+    archived_at: str | None = None
+    updated_at: str | None = None
+
+
+class KnowledgeBaseAnswerTranslation(ZammadModel):
+    id: int
+    answer_id: int | None = None
+    title: str | None = None
+    content_id: int | None = None
+    kb_locale_id: int | None = None
+
+
+class KnowledgeBaseAnswerContent(ZammadModel):
+    id: int
+    body: str | None = None

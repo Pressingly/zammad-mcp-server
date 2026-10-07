@@ -32,6 +32,8 @@ ALL_TOOLS = {
     "get_organization",
     "search_organizations",
     "list_ticket_tags",
+    "search_knowledge_base",
+    "get_kb_answer",
 } | WRITE_TOOLS
 
 TICKET = {
