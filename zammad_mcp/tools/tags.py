@@ -38,15 +38,18 @@ def framed_tag(tag: str, ticket_id: int) -> str | None:
 
 
 async def tag_exists(session: ZammadSession, tag: str) -> bool | None:
-    """Whether Zammad already knows ``tag``; ``None`` when the lookup itself fails.
+    """Whether Zammad already knows ``tag``; ``None`` when that cannot be told.
 
-    ``/tag_search`` is a substring match, so only an exact name counts.
+    ``/tag_search`` is a substring match capped at ``TAG_SEARCH_LIMIT`` rows,
+    so only an exact name counts, and a full page without one proves nothing.
     """
     try:
         rows = as_list(await session.get("/tag_search", {"term": tag, "limit": TAG_SEARCH_LIMIT}))
     except ZammadError:
         return None
-    return any(isinstance(row, dict) and row.get("value") == tag for row in rows)
+    if any(isinstance(row, dict) and row.get("value") == tag for row in rows):
+        return True
+    return None if len(rows) >= TAG_SEARCH_LIMIT else False
 
 
 async def explain_add_refusal(session: ZammadSession, error: PermissionDenied, tag: str) -> str:

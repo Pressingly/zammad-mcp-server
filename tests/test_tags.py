@@ -7,6 +7,7 @@ import pytest
 
 from tests.conftest import admin_only_fake, unknown_role_fake
 from tests.helpers import data, tools, unframed
+from zammad_mcp.tools.tags import TAG_SEARCH_LIMIT
 
 TAG_WRITES = ("add_ticket_tag", "remove_ticket_tag")
 TAG_CALLS = {"add_ticket_tag": ("POST", "/tags/add"), "remove_ticket_tag": ("DELETE", "/tags/remove")}
@@ -107,6 +108,14 @@ async def test_add_refusal_with_a_failing_lookup_names_both_causes(settings, fak
     shaped = await data(settings, fake, "add_ticket_tag", tag_args())
     assert shaped.startswith("Error: Zammad refused the tag (HTTP 403: Not authorized); either you cannot change")
     assert "'tag_new'" in shaped
+
+
+async def test_a_full_tag_search_page_without_the_tag_is_inconclusive(settings, fake):
+    fake.on("POST", "/tags/add", status=403, json={"error": "Not authorized"})
+    rows = [{"id": index, "value": f"billing-{index}"} for index in range(TAG_SEARCH_LIMIT)]
+    fake.on("GET", "/tag_search", json=rows)
+    shaped = await data(settings, fake, "add_ticket_tag", tag_args())
+    assert shaped.startswith("Error: Zammad refused the tag (HTTP 403: Not authorized); either you cannot change")
 
 
 async def test_add_ticket_tag_surfaces_a_422(settings, fake):
