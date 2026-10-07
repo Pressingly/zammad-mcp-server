@@ -14,7 +14,9 @@ carries a per-user token (`Authorization: Token token=...`), never a shared admi
   about to be sent. Keep both guarantees.
 - `zammad_mcp/tools/`: one module per Zammad domain, each with `register(mcp, context)`.
 - `zammad_mcp/credentials/`: where each request's token comes from (`ZAMMAD_HTTP_TOKEN`, or `X-Zammad-Token` on
-  `/http/api-key/mcp`). In http mode `/mcp` is only mounted with `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`. `zammad_mcp/platform/` (FOSS-513) is a placeholder.
+  `/http/api-key/mcp`). In http mode `/mcp` is only mounted with `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`.
+- `zammad_mcp/platform/` (FOSS-513): Cognito OAuth plus per-user minted tokens, entered from `__main__` when
+  `COGNITO_USER_POOL_ID` is set. See `docs/platform-mode.md`.
 - `zammad_mcp/tiers.py`: the `tier:*` tags and the one `auth=` check that filters tools by tier.
 - `zammad_mcp/shaping.py`: compact output, `<untrusted_content>` framing, truncation. `confirmations.py`: two-step
   confirm tokens.
@@ -22,7 +24,7 @@ carries a per-user token (`Authorization: Token token=...`), never a shared admi
 ## Commands
 
 ```bash
-uv sync
+uv sync --all-extras
 uv run ruff format .
 uv run ruff check .
 uv run pytest --cov=zammad_mcp --cov-fail-under=80

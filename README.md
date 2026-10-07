@@ -5,9 +5,9 @@ It lets Claude, or any MCP client, work with Zammad tickets using **the caller's
 request carries a per-user API token, never a shared admin token, so Zammad itself decides what each user can see
 and change.
 
-Status: community core. Ticket, article, attachment, search, user, organization and tag tools work in stdio and
-HTTP. Tag writes, the knowledge base and email replies land next; platform mode (SSO with per-user minted tokens)
-after that.
+Status: Ticket, article, attachment, search, user, organization and tag tools work in stdio and
+HTTP. Tag writes, the knowledge base and email replies land next. Platform mode (SSO with per-user minted tokens)
+is available.
 
 ## Modes
 
@@ -24,11 +24,41 @@ Works against any Zammad 6.x or 7.x with a personal API token (Zammad: avatar me
     that token's owner. It is only mounted with `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`; `zammad-mcp http` refuses to
     start with `ZAMMAD_HTTP_TOKEN` set and the flag off. Use it only on a loopback or otherwise private listener.
 
-### Platform mode (coming)
+### Platform mode
 
-For deployments that put Zammad behind an SSO edge: users sign in with OAuth (AWS Cognito), and the server mints and
-caches a short-lived Zammad token for each user, bounded by that user's Zammad role. It is installed with the
-optional `[platform]` extra and enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it.
+For deployments that put Zammad behind an SSO edge with a trusted-header middleware: users sign in with OAuth
+(AWS Cognito, optionally through an mPass-style auth proxy), and the server mints and caches a Zammad token for
+each user, bounded by that user's Zammad role. It needs the optional `[platform]` extra (included in the Docker
+image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it.
+
+- `/mcp` is guarded by FastMCP's Cognito provider (OAuth 2.0 with dynamic client registration); every call runs
+  with the caller's minted token. `/http/api-key/mcp` stays available for personal tokens.
+- A token carries an explicit list: `ticket.agent`, `ticket.customer`, `knowledge_base.reader` and
+  `knowledge_base.editor`, intersected with the user's role. Never `admin.*`, `report` or `user_preferences.*`.
+- Tokens last at least 8 days, are cached for 6 (Fernet-encrypted in Valkey), are re-checked every 4 hours and
+  after a permission-gated 403, and are re-minted after a 401. Only expired tokens of this server are cleaned up.
+- Unverified users (an identity in `DEFAULT_EMAIL_DOMAIN`, or without `@`) are refused before any Zammad call.
+- The tool list is filtered per user and fails closed: if the mint fails, only `get_me` is listed, and it explains
+  why.
+- Every failure fails closed; there is no fallback to a shared token.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COGNITO_USER_POOL_ID` | required | Turns platform mode on |
+| `COGNITO_AWS_REGION` | required | Cognito region |
+| `OIDC_CLIENT_ID` | required | Cognito app client id |
+| `OIDC_CLIENT_SECRET` or `MCP_JWT_SIGNING_KEY` | one required | Client secret (confidential client) or signing key (public client) |
+| `MCP_BASE_URL` | required | Public URL of this server; register `<MCP_BASE_URL>/auth/callback` in Cognito |
+| `ZAMMAD_INTERNAL_BASE_URL` | required | Zammad on the internal network; every Zammad call goes here |
+| `DEFAULT_EMAIL_DOMAIN` | required | Domain of unverified users, who are refused |
+| `MCP_OAUTH_STORAGE_URL` | unset | Valkey URL (`redis://`, `rediss://`, `valkey://`, `valkeys://`) for OAuth state, tokens and confirmations |
+| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | unset (any) | Comma-separated redirect URI patterns for client registration |
+| `COGNITO_UPSTREAM_AUTH_URL` / `COGNITO_UPSTREAM_TOKEN_URL` | discovered | Route `/authorize` and `/token` through an auth proxy |
+| `MCP_ACCESS_TOKEN_TTL_SECONDS` | `86400` | Lifetime of the token issued to the MCP client |
+| `MCP_OIDC_SCOPES` | `openid` | Upstream scopes |
+| `MCP_LOG_LEVEL` | `INFO` | JSON log level |
+
+See [docs/platform-mode.md](docs/platform-mode.md) for the mint flow, the cache and every setting.
 
 ## Quick start
 
