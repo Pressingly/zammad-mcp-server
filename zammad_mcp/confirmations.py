@@ -6,6 +6,11 @@ the record out atomically (single use, even when the check then fails), and
 succeeds only if it has not expired and identity, action and payload all
 match. Records are stored under ``sha256(token)``, never the token itself.
 
+``issue(..., keep_payload=True)`` also stores the payload, for actions whose
+confirming call cannot repeat it (an email body). ``redeem`` then takes the
+record out the same way, checks identity and action, re-checks the stored
+payload against its digest, and returns it.
+
 The backend is a two-method protocol: :class:`MemoryConfirmationBackend` now,
 a Valkey one later (``SET key value EX ttl`` and ``GETDEL key``).
 """
@@ -77,6 +82,7 @@ class _Record:
     action: str
     payload_sha256: str
     expires_at: float
+    payload: Any = None
 
 
 class Confirmations:
@@ -95,21 +101,44 @@ class Confirmations:
     def ttl_seconds(self) -> int:
         return self._ttl
 
-    async def issue(self, *, identity: str, action: str, payload: Any) -> str:
+    async def issue(self, *, identity: str, action: str, payload: Any, keep_payload: bool = False) -> str:
         token = secrets.token_urlsafe(32)
-        record = _Record(identity, action, payload_digest(payload), self._clock() + self._ttl)
+        record = _Record(
+            identity,
+            action,
+            payload_digest(payload),
+            self._clock() + self._ttl,
+            payload if keep_payload else None,
+        )
         await self._backend.put(_storage_key(token), json.dumps(asdict(record)), self._ttl)
         return token
 
     async def consume(self, token: str, *, identity: str, action: str, payload: Any) -> None:
         """Spend ``token``; raise :class:`ConfirmationError` unless it matches this exact request."""
+        record = await self._take(token)
+        expected = (identity, action, payload_digest(payload))
+        actual = (record.identity, record.action, record.payload_sha256)
+        if not _all_equal(expected, actual):
+            raise ConfirmationError("confirmation token does not match this request; prepare the action again")
+
+    async def redeem(self, token: str, *, identity: str, action: str) -> Any:
+        """Spend ``token`` and return the payload ``issue`` kept; raise :class:`ConfirmationError` on any mismatch."""
+        record = await self._take(token)
+        if not _all_equal((identity, action), (record.identity, record.action)):
+            raise ConfirmationError("confirmation token does not match this request; prepare the action again")
+        if record.payload is None or not _all_equal((payload_digest(record.payload),), (record.payload_sha256,)):
+            raise ConfirmationError("confirmation record failed its integrity check; prepare the action again")
+        return record.payload
+
+    async def _take(self, token: str) -> _Record:
         raw = await self._backend.take(_storage_key(token)) if token else None
         if raw is None:
             raise ConfirmationError("confirmation token is unknown, already used or expired; prepare the action again")
         record = _Record(**json.loads(raw))
         if record.expires_at <= self._clock():
             raise ConfirmationError("confirmation token expired; prepare the action again")
-        expected = (identity, action, payload_digest(payload))
-        actual = (record.identity, record.action, record.payload_sha256)
-        if not all(hmac.compare_digest(a, b) for a, b in zip(expected, actual, strict=True)):
-            raise ConfirmationError("confirmation token does not match this request; prepare the action again")
+        return record
+
+
+def _all_equal(expected: tuple[str, ...], actual: tuple[str, ...]) -> bool:
+    return all(hmac.compare_digest(a.encode(), b.encode()) for a, b in zip(expected, actual, strict=True))

@@ -132,3 +132,63 @@ def test_payload_digest_is_order_independent():
 
 def test_ttl_is_exposed(confirmations):
     assert confirmations.ttl_seconds == 600
+
+
+# --- redeem: the confirming call gets the kept payload back ---
+
+
+async def issue_kept(confirmations: Confirmations) -> str:
+    return await confirmations.issue(identity="id-1", action="email_reply", payload=PAYLOAD, keep_payload=True)
+
+
+def rewrite_record(backend: MemoryConfirmationBackend, **changes) -> None:
+    ((key, (raw, expires_at)),) = backend._values.items()
+    backend._values = {key: (json.dumps({**json.loads(raw), **changes}), expires_at)}
+
+
+async def test_redeem_returns_the_kept_payload_once(confirmations):
+    token = await issue_kept(confirmations)
+    assert await confirmations.redeem(token, identity="id-1", action="email_reply") == PAYLOAD
+    with pytest.raises(ConfirmationError, match="already used"):
+        await confirmations.redeem(token, identity="id-1", action="email_reply")
+
+
+async def test_payload_is_only_kept_on_request(confirmations, backend):
+    await issue(confirmations)
+    ((raw, _),) = backend._values.values()
+    assert json.loads(raw)["payload"] is None
+
+
+async def test_redeem_without_a_kept_payload_is_refused(confirmations):
+    token = await confirmations.issue(identity="id-1", action="email_reply", payload=PAYLOAD)
+    with pytest.raises(ConfirmationError, match="integrity"):
+        await confirmations.redeem(token, identity="id-1", action="email_reply")
+
+
+@pytest.mark.parametrize(("identity", "action"), [("id-2", "email_reply"), ("id-1", "apply_macro")])
+async def test_redeem_mismatch_is_refused_and_burns_the_token(confirmations, identity, action):
+    token = await issue_kept(confirmations)
+    with pytest.raises(ConfirmationError, match="does not match"):
+        await confirmations.redeem(token, identity=identity, action=action)
+    with pytest.raises(ConfirmationError, match="already used"):
+        await confirmations.redeem(token, identity="id-1", action="email_reply")
+
+
+async def test_redeem_refuses_a_tampered_payload(confirmations, backend):
+    token = await issue_kept(confirmations)
+    rewrite_record(backend, payload={**PAYLOAD, "to": ["attacker@example.com"]})
+    with pytest.raises(ConfirmationError, match="integrity"):
+        await confirmations.redeem(token, identity="id-1", action="email_reply")
+
+
+async def test_redeem_refuses_an_expired_token(confirmations, clock):
+    token = await issue_kept(confirmations)
+    clock.now += 601
+    with pytest.raises(ConfirmationError, match="unknown, already used or expired"):
+        await confirmations.redeem(token, identity="id-1", action="email_reply")
+
+
+async def test_non_ascii_identities_compare_safely(confirmations):
+    token = await confirmations.issue(identity="ü-1", action="email_reply", payload=PAYLOAD, keep_payload=True)
+    with pytest.raises(ConfirmationError, match="does not match"):
+        await confirmations.redeem(token, identity="ü-2", action="email_reply")
