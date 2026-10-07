@@ -63,21 +63,52 @@ def test_identity_for_needs_a_token():
 
 
 @pytest.mark.parametrize(
-    ("email", "default_domain", "synthetic"),
+    ("email", "username", "default_domain", "synthetic"),
     [
-        ("ada@example.com", "askii.ai", False),
-        ("9990000000000001@askii.ai", "askii.ai", True),
-        ("x@askii.ai", " ASKII.AI ", True),
-        ("x@sub.askii.ai", "askii.ai", False),
-        ("9990000000000001", "askii.ai", True),
-        ("9990000000000001", None, True),
-        ("@askii.ai", "askii.ai", True),
-        ("x@", "askii.ai", True),
-        ("x@askii.ai", "", False),
+        ("ada@example.com", "sid-1", "askii.ai", False),
+        ("sid-1@askii.ai", "sid-1", "askii.ai", True),
+        ("sid-1@askii.ai", "SID-1", " ASKII.AI ", True),
+        ("jane@askii.ai", "sid-1", "askii.ai", False),
+        ("jane@askii.ai", None, "askii.ai", True),
+        ("sid-1@sub.askii.ai", "sid-1", "askii.ai", False),
+        ("9990000000000001", "9990000000000001", "askii.ai", True),
+        ("9990000000000001", None, None, True),
+        ("@askii.ai", "sid-1", "askii.ai", True),
+        ("x@", "sid-1", "askii.ai", True),
+        ("sid-1@askii.ai", "sid-1", "", False),
+    ],
+    ids=[
+        "real-address",
+        "exact-synthetic-shape",
+        "case-insensitive",
+        "real-address-on-the-synthetic-domain",
+        "domain-match-without-username-fails-closed",
+        "subdomain",
+        "bare-username",
+        "bare-username-without-domain",
+        "empty-local-part",
+        "empty-domain",
+        "no-default-domain",
     ],
 )
-def test_synthetic_identities(email, default_domain, synthetic):
-    assert Identity(email=email).is_synthetic(default_domain) is synthetic
+def test_synthetic_identities(email, username, default_domain, synthetic):
+    claims = {"cognito:username": username} if username else {}
+
+    assert Identity(email=email, claims=claims).is_synthetic(default_domain) is synthetic
+
+
+def test_identity_for_carries_the_cognito_username():
+    token = AccessToken(
+        token="t",
+        client_id="c",
+        scopes=[],
+        claims=claims(email="Jane@AskII.ai", **{"cognito:username": "sid-9"}),
+    )
+
+    found = identity_for(token)
+
+    assert found.cognito_username == "sid-9"
+    assert found.is_synthetic("askii.ai") is False
 
 
 def test_no_request_means_no_identity():

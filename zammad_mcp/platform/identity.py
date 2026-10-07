@@ -75,6 +75,10 @@ class Identity:
     claims: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
+    def cognito_username(self) -> str | None:
+        return _non_empty(self.claims.get(COGNITO_USERNAME_CLAIM))
+
+    @property
     def key(self) -> str:
         return hash_identity(self.email)
 
@@ -89,15 +93,22 @@ class Identity:
         return domain if at and local and domain else None
 
     def is_synthetic(self, default_email_domain: str | None) -> bool:
-        """An unverified platform user.
+        """An unverified platform user, matched the way the launchpad verify-gate matches (ADR-0004).
 
-        Zammad's middleware appends ``DEFAULT_EMAIL_DOMAIN`` to any claim
-        without ``@``, so a bare username is as synthetic as an address in
-        that domain.
+        mpass-auth-proxy gives an unverified user exactly
+        ``<cognito:username>@<DEFAULT_EMAIL_DOMAIN>``. The domain alone proves
+        nothing, since it can also be a real mail domain. Zammad's middleware
+        appends the domain to any claim without ``@``, so a bare value is
+        synthetic too. A domain match without a ``cognito:username`` to
+        compare against fails closed.
         """
         if self.domain is None:
             return True
-        return bool(default_email_domain) and self.domain == default_email_domain.strip().lower()
+        domain = (default_email_domain or "").strip().lower()
+        if not domain or self.domain != domain:
+            return False
+        username = self.cognito_username
+        return username is None or self.email == f"{username}@{domain}".lower()
 
 
 def identity_for(token: AccessToken | None) -> Identity | None:
