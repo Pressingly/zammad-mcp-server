@@ -108,11 +108,11 @@ Valkey database holds:
 | `zammad-mcp:token:v1:<namespace>:*` | Minted tokens, Fernet-encrypted |
 | `zammad-mcp:recheck:v1:<namespace>:*` | 403 re-check markers, 5-minute TTL |
 | `zammad-mcp:confirm:v1:*` | Two-step confirmations, Fernet-encrypted (they can hold a whole email) |
-| `zammad-mcp:confirm-bytes:v1:<namespace>` | Sizes of live confirmations, for the byte cap |
+| `zammad-mcp:confirm-bytes:v1:<namespace>:*` | Confirmation sizes, expiries and running total, for the byte cap |
 
 Confirmations in Valkey share a 128 MiB cap (plaintext bytes; Fernet adds about a third in Valkey memory), with the
 last 8 MiB kept for small records, like the in-process store. A full store refuses the next large record with a
-clear message. Without `MCP_OAUTH_STORAGE_URL` everything lives in process: it is lost on restart and not shared
+clear message. Each store and take is one Lua script, so the cap holds across replicas without retries. Without `MCP_OAUTH_STORAGE_URL` everything lives in process: it is lost on restart and not shared
 between replicas.
 
 ## Configuration

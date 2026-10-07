@@ -203,7 +203,9 @@ async def test_expired_records_free_their_bytes(redis, clock):
     clock.now += 61
 
     await backend.put("b", large, 60)
-    assert await redis.zcard("zammad-mcp:confirm-bytes:v1:test") == 1
+    assert await redis.zcard("zammad-mcp:confirm-bytes:v1:test:expiry") == 1
+    assert await redis.hkeys("zammad-mcp:confirm-bytes:v1:test:sizes") == ["b"]
+    assert await backend.held_bytes() == len(large)
 
 
 async def test_rewriting_a_key_counts_it_once(redis, clock):
@@ -213,12 +215,36 @@ async def test_rewriting_a_key_counts_it_once(redis, clock):
     await backend.put("a", large, 60)
     await backend.put("a", large, 60)
 
+    assert await backend.held_bytes() == len(large)
+
 
 async def test_a_record_sealed_with_another_key_reads_as_absent(redis, clock):
     other = ValkeyConfirmationBackend(redis, fernet_for("old", CONFIRMATION_SALT), namespace="test", clock=clock)
     await other.put("k", "v", 60)
 
-    assert await valkey_backend(redis, clock).take("k") is None
+    backend = valkey_backend(redis, clock)
+    assert await backend.take("k") is None
+    assert await backend.held_bytes() == 0
+    assert await redis.hlen("zammad-mcp:confirm-bytes:v1:test:sizes") == 0
+    assert await redis.zcard("zammad-mcp:confirm-bytes:v1:test:expiry") == 0
+
+
+async def test_taking_a_missing_record_changes_nothing(redis, clock):
+    backend = valkey_backend(redis, clock)
+    await backend.put("a", "v", 60)
+
+    assert await backend.take("missing") is None
+    assert await backend.held_bytes() == 1
+
+
+async def test_an_expired_record_reads_as_absent_and_is_pruned(redis, clock):
+    backend = valkey_backend(redis, clock)
+    await backend.put("a", "v" * 10, 60)
+    clock.now += 61
+    await redis.delete("a")
+
+    assert await backend.take("a") is None
+    assert await backend.held_bytes() == 0
 
 
 async def test_oauth_storage_round_trips_encrypted(redis):
