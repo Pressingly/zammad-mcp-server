@@ -114,7 +114,9 @@ Valkey database holds:
 
 Confirmations in Valkey share a 128 MiB cap (plaintext bytes; Fernet adds about a third in Valkey memory), with the
 last 8 MiB kept for small records, like the in-process store. A full store refuses the next large record with a
-clear message. Each store and take is one Lua script, so the cap holds across replicas without retries. Without `MCP_OAUTH_STORAGE_URL` everything lives in process: it is lost on restart and not shared
+clear message. Each store and take is one Lua script, so the cap holds across replicas without retries. The per-user limits (20
+waiting actions and a quarter of the store each) are counted in each process, and records are bound to the identity
+hash, never the email. Without `MCP_OAUTH_STORAGE_URL` everything lives in process: it is lost on restart and not shared
 between replicas.
 
 ## Configuration

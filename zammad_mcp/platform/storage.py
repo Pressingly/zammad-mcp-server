@@ -24,7 +24,7 @@ from urllib.parse import urlparse, urlunparse
 from cryptography.fernet import Fernet, InvalidToken
 from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 
-from zammad_mcp.confirmations import ConfirmationError
+from zammad_mcp.confirmations import MAX_MEMORY_BYTES, SMALL_RECORD_BYTES, ConfirmationLimitError, utf8_size
 
 if TYPE_CHECKING:
     from key_value.aio.protocols.key_value import AsyncKeyValue
@@ -33,8 +33,6 @@ if TYPE_CHECKING:
 OAUTH_STATE_SALT = "fastmcp-storage-encryption-key"
 CONFIRMATION_SALT = "zammad-mcp-confirmations"
 CONFIRMATION_LEDGER_PREFIX = "zammad-mcp:confirm-bytes:v1:"
-MAX_CONFIRMATION_BYTES = 128 * 1024 * 1024
-SMALL_RECORD_BYTES = 64 * 1024
 SCHEME_ALIASES = {"valkey": "redis", "valkeys": "rediss"}
 ACCEPTED_SCHEMES = frozenset({"redis", "rediss", "valkey", "valkeys"})
 
@@ -178,12 +176,8 @@ class MemoryKeyValue:
         return entry[0] if entry else None
 
 
-class ConfirmationStoreFullError(ConfirmationError):
+class ConfirmationStoreFullError(ConfirmationLimitError):
     """The shared confirmation store is at its byte cap."""
-
-
-def _utf8_size(text: str) -> int:
-    return len(text.encode("utf-8", "surrogatepass"))
 
 
 _PRUNE = """
@@ -241,9 +235,12 @@ class ValkeyConfirmationBackend:
       Fernet-encrypted at rest (authenticated: a rewritten record fails to
       decrypt). One that does not decrypt, after a key rotation say, reads as
       absent and the caller prepares the action again.
-    - A global byte cap matches the in-memory backend: ``max_bytes`` of
-      plaintext UTF-8, the last ``small_record_reserve`` of it kept for
-      records under ``SMALL_RECORD_BYTES``. Fernet adds about a third on top
+    - A global byte cap matches the in-memory backend: ``max_bytes`` of the
+      record's UTF-8 bytes (``utf8_size``, as ``Confirmations`` sizes them),
+      the last ``small_record_reserve`` of it kept for records under
+      ``SMALL_RECORD_BYTES``. A full store raises
+      :class:`ConfirmationStoreFullError`, a ``ConfirmationLimitError``, so the
+      prepare tools answer with a clean ``Error:`` string. Fernet adds about a third on top
       in Valkey memory; a 20 MB record fits.
     - Each operation is one Lua script, so it is atomic without ``WATCH``
       retries: ``put`` prunes expired entries, checks the cap and stores the
@@ -259,7 +256,7 @@ class ValkeyConfirmationBackend:
         fernet: Fernet,
         *,
         namespace: str,
-        max_bytes: int = MAX_CONFIRMATION_BYTES,
+        max_bytes: int = MAX_MEMORY_BYTES,
         small_record_reserve: int | None = None,
         clock: Clock = time.time,
     ) -> None:
@@ -281,7 +278,7 @@ class ValkeyConfirmationBackend:
         return int(await self._client.eval(HELD_SCRIPT, 4, *self._keys(""), self._clock()))
 
     async def put(self, key: str, value: str, ttl_seconds: int) -> None:
-        size = _utf8_size(value)
+        size = utf8_size(value)
         sealed = self._fernet.encrypt(value.encode("utf-8", "surrogatepass")).decode()
         stored = await self._client.eval(
             PUT_SCRIPT, 4, *self._keys(key), self._clock(), sealed, ttl_seconds, size, self._limit_for(size)
