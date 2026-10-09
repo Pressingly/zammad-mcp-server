@@ -23,6 +23,29 @@ reasonable time to release a fix before disclosing publicly. We are happy to cre
 - Sending `X-Auth-Request-*` or other trusted identity headers to Zammad.
 - Bypassing a disabled tool flag or a confirmation step.
 
+## Known Zammad behaviour
+
+- **An `X-Auth-Request-Email` header overrides token auth** on an SSO-fronted Zammad: the header opens a session
+  for that user and the token's permissions are ignored. This is why the server refuses to send any
+  `X-Auth-Request-*` header and strips them from requests arriving on `/http/api-key/mcp`.
+- **Customer ticket search matches internal notes.** Without Elasticsearch, Zammad's database search joins every
+  article, so a customer's search can match a word that only appears in an agent's internal note on that
+  customer's own ticket. Only the fact that the ticket matched is revealed, never the note. The server returns
+  tickets, never match snippets.
+
+## Deployment notes
+
+- **The shared-token route acts as the token's owner.** `/mcp` is only served in http mode when
+  `ZAMMAD_HTTP_SHARED_TOKEN_ROUTE=true`, and then every caller who can reach the port works in Zammad as the owner of
+  `ZAMMAD_HTTP_TOKEN`, with no authentication of their own. The server refuses to start in http mode with the token
+  set and the flag off. Multi-user deployments should use `/http/api-key/mcp`, where each caller sends their own
+  token.
+- **Platform mode does not serve the personal-token route by default.** `/http/api-key/mcp` replays the caller's
+  `X-Zammad-Token` to the internal Zammad URL, which skips the SSO proxy and the corporate-ID gate, so a leaver's or
+  leaked personal token would keep working. With `COGNITO_USER_POOL_ID` set, the route is only mounted when
+  `ZAMMAD_HTTP_API_KEY_ROUTE=true`, and the server then logs a startup warning. Do not rely on a router rule to
+  hide it instead: a path-prefix exclusion can be bypassed with an encoded path such as `/http%2Fapi-key/mcp`.
+
 ## Out of scope
 
 - Prompt injection that only makes the model misuse tools the user already holds, unless it bypasses a

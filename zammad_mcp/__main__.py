@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import uvicorn
 
+from zammad_mcp import platform
 from zammad_mcp.config import ConfigError, Settings
 from zammad_mcp.server import build_http_app, build_server
 
@@ -22,6 +23,9 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     transport = parse_args(argv).transport
+    if transport == "http" and platform.enabled():
+        platform.run()
+        return
     try:
         settings = Settings.from_env()
     except ConfigError as error:
@@ -30,7 +34,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if transport == "stdio":
         mcp.run()
         return
-    uvicorn.run(build_http_app(mcp), host="0.0.0.0", port=settings.http_port, access_log=False)
+    try:
+        app = build_http_app(mcp, settings)
+    except ConfigError as error:
+        sys.exit(f"zammad-mcp: {error}")
+    uvicorn.run(app, host="0.0.0.0", port=settings.http_port, access_log=False)
 
 
 if __name__ == "__main__":
