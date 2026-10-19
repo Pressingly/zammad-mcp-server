@@ -79,7 +79,7 @@ async def test_macro_tools_carry_their_annotations(macro_settings, zammad):
     hints = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
     expected = {
         "list_macros": (True, False, True, True),
-        "prepare_apply_macro": (True, False, False, True),
+        "prepare_apply_macro": (False, False, False, True),
         "apply_macro": (False, True, False, True),
     }
     for name, values in expected.items():

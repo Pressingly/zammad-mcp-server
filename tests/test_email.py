@@ -231,7 +231,7 @@ async def test_flag_on_registers_both_tools_with_their_annotations(email_setting
     listed = await tools(email_settings, zammad)
     prepare_tool, send_tool = listed["prepare_email_reply"], listed["send_email_reply"]
     hints = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
-    assert tuple(getattr(prepare_tool.annotations, hint) for hint in hints) == (True, False, False, True)
+    assert tuple(getattr(prepare_tool.annotations, hint) for hint in hints) == (False, False, False, True)
     assert tuple(getattr(send_tool.annotations, hint) for hint in hints) == (False, True, False, True)
     for tool in (prepare_tool, send_tool):
         assert {"tier:agent", "module:email_replies"} <= set(tool.meta["fastmcp"]["tags"])
