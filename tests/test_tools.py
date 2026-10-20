@@ -87,6 +87,33 @@ async def test_every_module_on_gives_every_tool_all_four_annotations(settings, f
     assert read_only == (ALL_TOOLS | OPT_IN_TOOLS) - WRITE_TOOLS - CONFIRMED_WRITES
 
 
+READS = (ALL_TOOLS | OPT_IN_TOOLS) - WRITE_TOOLS - CONFIRMED_WRITES
+NON_DESTRUCTIVE_WRITES = {
+    "create_ticket",
+    "add_ticket_note",
+    "add_ticket_tag",
+    "prepare_email_reply",
+    "prepare_apply_macro",
+}
+DESTRUCTIVE_WRITES = (WRITE_TOOLS | CONFIRMED_WRITES) - NON_DESTRUCTIVE_WRITES
+
+
+async def test_every_registered_tool_is_classified_read_or_write_by_what_it_does(settings, fake):
+    everything = dataclasses.replace(settings, enabled_modules=frozenset(TOOL_MODULES))
+    listed = await tools(everything, fake)
+    assert set(listed) == READS | NON_DESTRUCTIVE_WRITES | DESTRUCTIVE_WRITES
+    for name, tool in listed.items():
+        hints = tool.annotations.model_dump()
+        tags = tool.meta["fastmcp"]["tags"]
+        if name in READS:
+            assert (hints["readOnlyHint"], hints["destructiveHint"]) == (True, False), name
+            assert "read" in tags, name
+            continue
+        assert hints["readOnlyHint"] is False, name
+        assert hints["destructiveHint"] is (name in DESTRUCTIVE_WRITES), name
+        assert "write" in tags, name
+
+
 async def test_read_only_drops_exactly_the_writes(settings, fake):
     names = set(await tools(dataclasses.replace(settings, read_only=True), fake))
     assert names == ALL_TOOLS - WRITE_TOOLS
