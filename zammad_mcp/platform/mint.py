@@ -424,7 +424,8 @@ class TokenSession:
 
     async def open(self, identity: Identity) -> SessionGrant:
         """The only request that carries the identity headers, so the only one that carries the edge secret."""
-        edge = {EDGE_SECRET_HEADER: self._edge_secret} if self._edge_secret else {}
+        edge_secret_sent = bool(self._edge_secret)
+        edge = {EDGE_SECRET_HEADER: self._edge_secret} if edge_secret_sent else {}
         headers = {**edge, self._email_header: identity.email}
         if identity.access_token:
             headers[self._access_token_header] = identity.access_token
@@ -433,7 +434,7 @@ class TokenSession:
         if cookie:
             self._opened = (cookie, csrf)
         if not response.is_success:
-            raise bootstrap_error(response, edge_secret_sent=self._edge_secret is not None)
+            raise bootstrap_error(response, edge_secret_sent=edge_secret_sent)
         body = _json_object(response)
         if not cookie or not csrf:
             raise MintError("Zammad did not open a session for the token request; is its SSO middleware enabled?")
