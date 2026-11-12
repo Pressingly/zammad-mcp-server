@@ -44,7 +44,8 @@ class FakeUser:
 class FakeSsoZammad(RecordingTransport):
     """Header sessions, CSRF, minting and token auth, with the quirks the spikes recorded."""
 
-    def __init__(self, *, corporate_gate: bool = False, edge_secret: str = EDGE_SECRET) -> None:
+    def __init__(self, *, corporate_gate: bool = False, edge_secret: str | None = EDGE_SECRET) -> None:
+        """``edge_secret=None`` is a Zammad without the edge check, which trusts the identity headers as they come."""
         self.edge_secret = edge_secret
         self.users: dict[str, FakeUser] = {}
         self.sessions: dict[str, tuple[str, str]] = {}
@@ -78,7 +79,7 @@ class FakeSsoZammad(RecordingTransport):
         return json.loads(self.posts()[index].content)
 
     def _from_edge(self, request: httpx.Request) -> bool:
-        return request.headers.get("x-mpass-edge-secret") == self.edge_secret
+        return self.edge_secret is None or request.headers.get("x-mpass-edge-secret") == self.edge_secret
 
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
         """Like the patched middleware, identity headers without the edge secret are dropped, not refused."""

@@ -285,8 +285,9 @@ def _log_edge_secret(platform: PlatformSettings) -> None:
     if problem is None:
         return
     logger.error(
-        "ZAMMAD_EDGE_SECRET is %s: Zammad ignores the SSO identity headers without its MPASS_EDGE_SECRET, so no "
-        "Zammad token can be minted or re-checked; set it to the value Zammad uses (at least %d characters)",
+        "ZAMMAD_EDGE_SECRET is %s: the token bootstrap is sent without it, and a Zammad that checks its "
+        "MPASS_EDGE_SECRET ignores the SSO identity headers, so no Zammad token can be minted or re-checked; "
+        "set it to the value Zammad uses (printable ASCII, at least %d characters)",
         problem,
         MIN_EDGE_SECRET_LENGTH,
     )

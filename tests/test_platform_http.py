@@ -433,7 +433,12 @@ def _edge_secret_errors(caplog) -> list[logging.LogRecord]:
 
 @pytest.mark.parametrize(
     ("value", "problem"),
-    [(None, "unset"), ("CHANGE_ME_" + "x" * 40, "a placeholder"), ("x" * 31, "shorter than 32 characters")],
+    [
+        (None, "unset"),
+        ("CHANGE_ME_" + "x" * 40, "a placeholder"),
+        ("x" * 31, "shorter than 32 characters"),
+        ("x" * 40 + "\u00e9", "not printable ASCII"),
+    ],
 )
 def test_run_logs_an_error_for_an_unusable_edge_secret(monkeypatch, platform_env, caplog, value, problem):
     if value is not None:
