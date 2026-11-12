@@ -15,7 +15,7 @@ from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from key_value.aio.stores.memory import MemoryStore
 
 from tests.helpers import MCP_HEADERS
-from tests.platform_fakes import AGENT_PERMISSIONS, COOKIE_NAME, CUSTOMER_PERMISSIONS, FakeSsoZammad
+from tests.platform_fakes import AGENT_PERMISSIONS, COOKIE_NAME, CUSTOMER_PERMISSIONS, EDGE_SECRET, FakeSsoZammad
 from zammad_mcp.config import Settings
 from zammad_mcp.platform.http import build_platform_server
 from zammad_mcp.platform.settings import PlatformSettings
@@ -32,6 +32,7 @@ ENV = {
     "ZAMMAD_INTERNAL_BASE_URL": "http://zammad-nginx:8080",
     "DEFAULT_EMAIL_DOMAIN": "askii.ai",
     "MCP_ALLOWED_CLIENT_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
+    "ZAMMAD_EDGE_SECRET": EDGE_SECRET,
 }
 DISCOVERY = OIDCConfiguration(
     strict=False,

@@ -301,6 +301,7 @@ def platform_env(monkeypatch):
         "MCP_OAUTH_STORAGE_URL",
         "MCP_JWT_SIGNING_KEY",
         "MCP_HTTP_PORT",
+        "ZAMMAD_EDGE_SECRET",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in ENV.items():
@@ -424,3 +425,42 @@ def test_the_namespace_separates_deployments_sharing_one_valkey():
     assert len(first.namespace) == 12
     assert len({first.namespace, second.namespace, third.namespace}) == 3
     assert first.namespace == PlatformSettings.from_env(ENV).namespace
+
+
+def _edge_secret_errors(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == logging.ERROR and "ZAMMAD_EDGE_SECRET" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [(None, "unset"), ("CHANGE_ME_" + "x" * 40, "a placeholder"), ("x" * 31, "shorter than 32 characters")],
+)
+def test_run_logs_an_error_for_an_unusable_edge_secret(monkeypatch, platform_env, caplog, value, problem):
+    if value is not None:
+        monkeypatch.setenv("ZAMMAD_EDGE_SECRET", value)
+
+    _run_and_capture(monkeypatch, caplog)
+
+    (error,) = _edge_secret_errors(caplog)
+    assert f"ZAMMAD_EDGE_SECRET is {problem}" in error.getMessage()
+    if value:
+        assert value not in caplog.text
+
+
+def test_run_is_quiet_about_a_usable_edge_secret(monkeypatch, platform_env, caplog):
+    secret = "s" * 32
+    monkeypatch.setenv("ZAMMAD_EDGE_SECRET", secret)
+
+    _run_and_capture(monkeypatch, caplog)
+
+    assert _edge_secret_errors(caplog) == []
+    assert secret not in caplog.text
+
+
+def test_edge_secret_is_read_trimmed_and_kept_out_of_repr():
+    secret = "edge-" + "s" * 40
+    platform = PlatformSettings.from_env({**ENV, "ZAMMAD_EDGE_SECRET": f"  {secret} "})
+
+    assert platform.edge_secret == secret
+    assert secret not in repr(platform)
+    assert PlatformSettings.from_env(ENV).edge_secret == ""

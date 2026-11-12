@@ -56,6 +56,7 @@ image) and is enabled by `COGNITO_USER_POOL_ID`. Community mode never imports it
 | `MCP_BASE_URL` | required | Public URL of this server; register `<MCP_BASE_URL>/auth/callback` in Cognito |
 | `ZAMMAD_INTERNAL_BASE_URL` | required | Zammad on the internal network; every Zammad call goes here |
 | `DEFAULT_EMAIL_DOMAIN` | required | Bare domain of unverified users' synthetic addresses, which are refused |
+| `ZAMMAD_EDGE_SECRET` | unset | Zammad's `MPASS_EDGE_SECRET` (32+ characters), sent only on the token bootstrap; without it no token can be minted (startup error) |
 | `MCP_OAUTH_STORAGE_URL` | unset | Valkey URL (`redis://`, `rediss://`, `valkey://`, `valkeys://`) for OAuth state, tokens and confirmations |
 | `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | required | Comma-separated redirect URI patterns for client registration; empty refuses to start |
 | `MCP_ALLOW_ANY_REDIRECT_URI` | `false` | `true` with no allow-list accepts any redirect URI (explicit opt-out) |

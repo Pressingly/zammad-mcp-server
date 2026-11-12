@@ -4,9 +4,12 @@ Bootstrap (cache miss, re-check, or a rejected token), always on a fresh
 httpx client of its own and the internal Zammad URL:
 
 1. ``GET /user_access_token`` with the SSO email header (plus the upstream
-   access token, for the corporate-ID gate, when there is one). Zammad's SSO
+   access token, for the corporate-ID gate, when there is one) and the edge
+   secret Zammad requires before it trusts those headers. Zammad's SSO
    middleware opens a session for that user and answers with a CSRF token
-   and the user's permissions.
+   and the user's permissions. Without a usable edge secret no request is
+   sent at all; an "Authentication required" answer means Zammad ignored the
+   headers (secret mismatch).
 2. The ceiling: mintable leaves the role holds (:mod:`.ceiling`). Empty
    fails closed.
 3. ``POST /user_access_token`` with that explicit list and
@@ -63,7 +66,7 @@ from zammad_mcp.client.errors import (
     error_detail,
     error_for_status,
 )
-from zammad_mcp.client.http import USER_AGENT, _cookieless_jar, is_valid_token
+from zammad_mcp.client.http import EDGE_SECRET_HEADER, USER_AGENT, _cookieless_jar, is_valid_token
 from zammad_mcp.platform.ceiling import (
     CeilingError,
     CeilingNarrower,
@@ -95,8 +98,11 @@ SIGNOUT_PATH = "/signout"
 SIGNOUT_TIMEOUT_SECONDS = 5.0
 DEFAULT_NAMESPACE = "local"
 CUSTOMER_TOKEN_ACCESS_DENIED = "user authorization failed."
+UNAUTHENTICATED_DETAIL = "authentication required"
 DEFAULT_EMAIL_HEADER = "X-Auth-Request-Email"
 DEFAULT_ACCESS_TOKEN_HEADER = "X-Auth-Request-Access-Token"
+MIN_EDGE_SECRET_LENGTH = 32
+EDGE_SECRET_PLACEHOLDER_PREFIX = "CHANGE_ME_"
 
 Clock = Callable[[], float]
 
@@ -123,6 +129,34 @@ class EmptyCeilingError(ZammadError):
             "your Zammad role holds none of the permissions this server uses "
             "(ticket.agent, ticket.customer, knowledge_base.reader, knowledge_base.editor)"
         )
+
+
+class EdgeSecretMissingError(ZammadError):
+    def __init__(self) -> None:
+        super().__init__(
+            "this server cannot sign users in to Zammad: ZAMMAD_EDGE_SECRET is unset, a placeholder or shorter "
+            f"than {MIN_EDGE_SECRET_LENGTH} characters; an operator must set it to Zammad's MPASS_EDGE_SECRET"
+        )
+
+
+class EdgeSecretRejectedError(ZammadError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Zammad ignored this server's SSO sign-in headers and treated the request as unauthenticated; "
+            "an operator must check that ZAMMAD_EDGE_SECRET "
+            "matches Zammad's MPASS_EDGE_SECRET and that Zammad's SSO middleware is enabled"
+        )
+
+
+def edge_secret_problem(secret: str) -> str | None:
+    """Why Zammad would not trust ``secret``, matching its own rule; ``None`` when it is usable."""
+    if not secret:
+        return "unset"
+    if secret.startswith(EDGE_SECRET_PLACEHOLDER_PREFIX):
+        return "a placeholder"
+    if len(secret) < MIN_EDGE_SECRET_LENGTH:
+        return f"shorter than {MIN_EDGE_SECRET_LENGTH} characters"
+    return None
 
 
 class MintError(ZammadError):
@@ -324,9 +358,20 @@ def permission_names(raw: Any) -> tuple[str, ...]:
     return tuple(name for name in map(_permission_name, raw) if name is not None)
 
 
+def _reached_zammad_unauthenticated(status_code: int, detail: str) -> bool:
+    return status_code == 401 or (status_code == 403 and detail.strip().lower() == UNAUTHENTICATED_DETAIL)
+
+
 def bootstrap_error(response: httpx.Response) -> ZammadError:
-    """Tell a Customer without token access apart from the SSO middleware's own 403s."""
+    """Tell an untrusted edge and a Customer without token access apart from the SSO middleware's own 403s.
+
+    The bootstrap always carries the email header, so Zammad answering as if
+    the request had no credentials at all means it dropped that header as
+    untrusted: the edge secret does not match.
+    """
     detail = error_detail(response)
+    if _reached_zammad_unauthenticated(response.status_code, detail):
+        return EdgeSecretRejectedError()
     if response.status_code == 403 and detail.strip().lower() == CUSTOMER_TOKEN_ACCESS_DENIED:
         return CustomerTokenAccessError()
     return error_for_status(response.status_code, detail)
@@ -358,10 +403,13 @@ def expired_mcp_token_ids(tokens: Iterable[Mapping[str, Any]], now: float) -> li
 class TokenSession:
     """One user's header session on one fresh httpx client; used for a single bootstrap."""
 
-    def __init__(self, client: httpx.AsyncClient, *, email_header: str, access_token_header: str) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, *, email_header: str, access_token_header: str, edge_secret: str
+    ) -> None:
         self._client = client
         self._email_header = email_header
         self._access_token_header = access_token_header
+        self._edge_secret = edge_secret
         self._opened: tuple[str, str] | None = None
 
     async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -371,7 +419,8 @@ class TokenSession:
             raise ZammadTransportError(f"could not reach Zammad to mint a token ({type(exc).__name__})") from exc
 
     async def open(self, identity: Identity) -> SessionGrant:
-        headers = {self._email_header: identity.email}
+        """The only request that carries the identity headers, so the only one that carries the edge secret."""
+        headers = {EDGE_SECRET_HEADER: self._edge_secret, self._email_header: identity.email}
         if identity.access_token:
             headers[self._access_token_header] = identity.access_token
         response = await self._send("GET", "/user_access_token", headers=headers)
@@ -449,12 +498,18 @@ class TokenEndpoint:
         transport: httpx.AsyncBaseTransport | None = None,
         email_header: str = DEFAULT_EMAIL_HEADER,
         access_token_header: str = DEFAULT_ACCESS_TOKEN_HEADER,
+        edge_secret: str = "",
     ) -> None:
         self._base_url = api_base_url.rstrip("/")
         self._timeout = timeout
         self._transport = transport
         self._email_header = email_header
         self._access_token_header = access_token_header
+        self._edge_secret = edge_secret
+
+    @property
+    def edge_secret_problem(self) -> str | None:
+        return edge_secret_problem(self._edge_secret)
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[TokenSession]:
@@ -472,7 +527,10 @@ class TokenEndpoint:
         )
         async with client:
             session = TokenSession(
-                client, email_header=self._email_header, access_token_header=self._access_token_header
+                client,
+                email_header=self._email_header,
+                access_token_header=self._access_token_header,
+                edge_secret=self._edge_secret,
             )
             try:
                 yield session
@@ -581,9 +639,18 @@ class TokenMinter:
             _audit("recheck_requested", identity, reason="forbidden")
         return requested
 
+    def _require_edge_secret(self, identity: Identity) -> None:
+        """No bootstrap leaves the process without a secret Zammad would trust; cached tokens keep working."""
+        if self._endpoint.edge_secret_problem is not None:
+            _audit("denied", identity, reason="edge_secret_missing")
+            raise EdgeSecretMissingError()
+
     async def _open(self, session: TokenSession, identity: Identity) -> SessionGrant:
         try:
             return await session.open(identity)
+        except EdgeSecretRejectedError:
+            _audit("denied", identity, reason="edge_secret_rejected")
+            raise
         except ZammadError as error:
             if _is_denial(error):
                 await self._cache.drop(identity.key)
@@ -591,11 +658,13 @@ class TokenMinter:
             raise
 
     async def _mint(self, identity: Identity, *, reason: str) -> MintedToken:
+        self._require_edge_secret(identity)
         async with self._endpoint.session() as session:
             grant = await self._open(session, identity)
             return await self._mint_with(session, grant, identity, reason=reason)
 
     async def _recheck(self, identity: Identity, cached: MintedToken) -> MintedToken:
+        self._require_edge_secret(identity)
         async with self._endpoint.session() as session:
             grant = await self._open(session, identity)
             ceiling = self._ceiling(grant, identity)

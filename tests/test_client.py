@@ -77,6 +77,8 @@ async def test_sends_token_per_call(recording_transport):
         "X-AUTH-REQUEST-User",
         "X_Auth_Request_Email",
         "x-auth_request-user",
+        "X-Mpass-Edge-Secret",
+        "x_mpass_edge_secret",
     ],
 )
 async def test_identity_header_guard_raises(recording_transport, header):
