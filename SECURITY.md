@@ -27,7 +27,9 @@ reasonable time to release a fix before disclosing publicly. We are happy to cre
 
 - **An `X-Auth-Request-Email` header overrides token auth** on an SSO-fronted Zammad: the header opens a session
   for that user and the token's permissions are ignored. This is why the server refuses to send any
-  `X-Auth-Request-*` header and strips them from requests arriving on `/http/api-key/mcp`.
+  `X-Auth-Request-*` header and strips them from requests arriving on `/http/api-key/mcp`. Our Zammad fork honours
+  the headers only with its `MPASS_EDGE_SECRET` in `X-Mpass-Edge-Secret`; the server sends that secret
+  (`ZAMMAD_EDGE_SECRET`) on the token bootstrap only, and the same guard and strip cover it.
 - **Customer ticket search matches internal notes.** Without Elasticsearch, Zammad's database search joins every
   article, so a customer's search can match a word that only appears in an agent's internal note on that
   customer's own ticket. Only the fact that the ticket matched is revealed, never the note. The server returns

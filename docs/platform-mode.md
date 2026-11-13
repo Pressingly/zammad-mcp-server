@@ -38,8 +38,16 @@ On a user's first call, or when their cached token needs replacing, the server o
 own against `ZAMMAD_INTERNAL_BASE_URL` and:
 
 1. Sends `GET /api/v1/user_access_token` with `X-Auth-Request-Email: <identity>` and, when the session has one,
-   `X-Auth-Request-Access-Token: <upstream Cognito access token>` for the corporate-ID gate. The middleware opens a
-   session for that user; Zammad answers with a `CSRF-TOKEN` header, the session cookie and the user's permissions.
+   `X-Auth-Request-Access-Token: <upstream Cognito access token>` for the corporate-ID gate, plus
+   `X-Mpass-Edge-Secret: <ZAMMAD_EDGE_SECRET>`. Zammad trusts the identity headers only with its `MPASS_EDGE_SECRET`
+   and drops them otherwise. The middleware opens a session for that user; Zammad answers with a `CSRF-TOKEN`
+   header, the session cookie and the user's permissions. An unset, placeholder (`CHANGE_ME_*`), non-printable-ASCII
+   or short (under 32 characters) secret is left out of the request, so a Zammad without the edge check keeps
+   working. A `403 Authentication required` (or 401) on this request means Zammad dropped the headers: without a
+   usable secret the error names the missing `ZAMMAD_EDGE_SECRET`, with one it says the secrets differ. Neither
+   drops the cached token.
+   The forwarded access token is the one FastMCP validated, and refreshed if it had expired, for the same request,
+   so it is current whenever a mint or re-check runs.
 2. Builds the ceiling: `{ticket.agent, ticket.customer, knowledge_base.reader, knowledge_base.editor}` intersected
    with the leaf permissions the role holds. `admin.*`, `report` and `user_preferences.*` never enter a token. A
    `narrow_ceiling(claims, ceiling)` hook can only remove permissions. An empty ceiling fails closed.
@@ -88,7 +96,8 @@ email capture off, mpass does not stamp tokens, so real addresses in `DEFAULT_EM
 - Any cache or mint error fails the request with an `Error: ...` message. Nothing falls back to another token. The
   one exception is an entry that no longer decrypts (a rotated secret): it is treated as absent and re-minted.
 - Every decision writes one JSON line on the `zammad_mcp.audit` logger: `token.minted` (with the reason),
-  `token.recheck_unchanged`, `token.recheck_requested`, `token.renew_reused`, `token.denied` and `token.refused`.
+  `token.recheck_unchanged`, `token.recheck_requested`, `token.renew_reused`, `token.denied` (reason is the error
+  class, `empty_ceiling`, `edge_secret_missing` or `edge_secret_rejected`) and `token.refused`.
   Each carries the identity hash and, where there is a token, its tier, sorted permissions and name. Never the token
   or the email.
 
@@ -156,6 +165,7 @@ between replicas.
 | `MCP_ENV` | | `production` adds a note to the warning when storage is in process |
 | `ZAMMAD_SSO_EMAIL_HEADER` | `X-Auth-Request-Email` | Identity header the SSO middleware trusts, for other deployments |
 | `ZAMMAD_SSO_ACCESS_TOKEN_HEADER` | `X-Auth-Request-Access-Token` | Access-token header for a corporate-ID gate |
+| `ZAMMAD_EDGE_SECRET` | unset | Zammad's `MPASS_EDGE_SECRET` (printable ASCII, at least 32 characters), sent as `X-Mpass-Edge-Secret` on the bootstrap `GET` only. Unset or unusable logs an ERROR at startup and the header is left out: a Zammad that checks it refuses every mint, while cached tokens keep working until their next re-check |
 | `ZAMMAD_HTTP_API_KEY_ROUTE` | `false` | `true` mounts `/http/api-key/mcp` for personal tokens, which bypasses the SSO proxy and the corporate-ID gate; logs a WARNING at startup |
 
 The refresh lifetime falls back to 30 days, since Cognito sends no `refresh_expires_in`. The community settings
@@ -165,9 +175,13 @@ The refresh lifetime falls back to 30 days, since Cognito sends no `refresh_expi
 ## Security notes
 
 - The steady-state client sends only `Authorization: Token token=...`, never a cookie and never an
-  `X-Auth-Request-*` header (a hard guard in the client). The identity headers appear only on the bootstrap `GET`.
-- Any container on the internal network can send `X-Auth-Request-Email` to Zammad directly. That exposure exists
-  without this server; keep the internal URL off untrusted networks.
-- Logs never contain tokens, cookies, CSRF tokens or bodies; cache keys are hashes of the identity.
+  `X-Auth-Request-*` or `X-Mpass-Edge-Secret` header (a hard guard in the client). The identity headers and the
+  edge secret appear only on the bootstrap `GET`.
+- Rollout: set `ZAMMAD_EDGE_SECRET` here to the same value as Zammad's `MPASS_EDGE_SECRET`, and deploy this server,
+  before deploying the Zammad that checks it. This server works against a Zammad with or without the check.
+- Zammad ignores `X-Auth-Request-Email` unless the request carries its `MPASS_EDGE_SECRET`, so a container on the
+  internal network cannot sign in as anyone without that secret. Treat `ZAMMAD_EDGE_SECRET` like a password: it lets
+  this server open a session for any user.
+- Logs never contain tokens, cookies, CSRF tokens, the edge secret or bodies; cache keys are hashes of the identity.
 - `/http/api-key/mcp` is not served unless `ZAMMAD_HTTP_API_KEY_ROUTE=true`; see
   [the personal-token route](#the-personal-token-route-is-off-by-default).

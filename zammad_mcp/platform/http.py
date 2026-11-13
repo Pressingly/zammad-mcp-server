@@ -44,7 +44,14 @@ from zammad_mcp.credentials import api_key_mount
 from zammad_mcp.credentials.header import API_KEY_MOUNT_PATH
 from zammad_mcp.platform.cognito import ZammadCognitoProvider
 from zammad_mcp.platform.credentials import MintedCredentialProvider, platform_tier_resolver
-from zammad_mcp.platform.mint import CACHE_SALT, TokenCache, TokenEndpoint, TokenMinter
+from zammad_mcp.platform.mint import (
+    CACHE_SALT,
+    MIN_EDGE_SECRET_LENGTH,
+    TokenCache,
+    TokenEndpoint,
+    TokenMinter,
+    edge_secret_problem,
+)
 from zammad_mcp.platform.settings import REFRESH_TOKEN_FALLBACK_SECONDS, PlatformSettings, community_settings
 from zammad_mcp.platform.storage import (
     CONFIRMATION_SALT,
@@ -118,6 +125,7 @@ def build_platform_server(
         transport=transport,
         email_header=platform.email_header,
         access_token_header=platform.access_token_header,
+        edge_secret=platform.edge_secret,
     )
     minter = TokenMinter(
         endpoint,
@@ -268,7 +276,21 @@ def _log_startup(settings: Settings, platform: PlatformSettings) -> None:
             " (production)" if platform.production else "",
         )
     _log_api_key_route(platform)
+    _log_edge_secret(platform)
     logger.info("register this callback URL in the Cognito app client: %s%s", platform.base_url, CALLBACK_PATH)
+
+
+def _log_edge_secret(platform: PlatformSettings) -> None:
+    problem = edge_secret_problem(platform.edge_secret)
+    if problem is None:
+        return
+    logger.error(
+        "ZAMMAD_EDGE_SECRET is %s: the token bootstrap is sent without it, and a Zammad that checks its "
+        "MPASS_EDGE_SECRET ignores the SSO identity headers, so no Zammad token can be minted or re-checked; "
+        "set it to the value Zammad uses (printable ASCII, at least %d characters)",
+        problem,
+        MIN_EDGE_SECRET_LENGTH,
+    )
 
 
 def _log_api_key_route(platform: PlatformSettings) -> None:

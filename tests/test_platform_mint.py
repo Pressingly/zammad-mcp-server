@@ -16,10 +16,17 @@ from tests.platform_fakes import (
     AGENT_PERMISSIONS,
     COOKIE_NAME,
     CUSTOMER_PERMISSIONS,
+    EDGE_SECRET,
     FakeSsoZammad,
     identity,
 )
-from zammad_mcp.client.errors import AccountInactiveError, GatewayDeniedError, ZammadTransportError, to_tool_error
+from zammad_mcp.client.errors import (
+    AccountInactiveError,
+    GatewayDeniedError,
+    PermissionDenied,
+    ZammadTransportError,
+    to_tool_error,
+)
 from zammad_mcp.client.http import USER_AGENT, is_identity_header
 from zammad_mcp.platform.ceiling import MINTABLE_PERMISSIONS
 from zammad_mcp.platform.identity import Identity
@@ -32,6 +39,8 @@ from zammad_mcp.platform.mint import (
     RECHECK_INTERVAL_SECONDS,
     CacheEntry,
     CustomerTokenAccessError,
+    EdgeSecretMissingError,
+    EdgeSecretRejectedError,
     EmptyCeilingError,
     KeyedLocks,
     MintedToken,
@@ -42,6 +51,7 @@ from zammad_mcp.platform.mint import (
     TokenEndpoint,
     TokenMinter,
     cache_ttl_seconds,
+    edge_secret_problem,
     expired_mcp_token_ids,
     permission_names,
     session_cookie,
@@ -94,8 +104,8 @@ def cache_for(store) -> TokenCache:
     return TokenCache(store, fernet_for("client-secret", CACHE_SALT), namespace=NAMESPACE)
 
 
-def make_minter(transport, store, clock, **options) -> TokenMinter:
-    endpoint = TokenEndpoint(API, timeout=httpx.Timeout(5.0), transport=transport)
+def make_minter(transport, store, clock, *, edge_secret: str = EDGE_SECRET, **options) -> TokenMinter:
+    endpoint = TokenEndpoint(API, timeout=httpx.Timeout(5.0), transport=transport, edge_secret=edge_secret)
     return TokenMinter(endpoint, cache_for(store), default_email_domain="askii.ai", clock=clock, **options)
 
 
@@ -826,3 +836,150 @@ async def test_a_hanging_signout_gives_up(store, clock, monkeypatch):
     )
 
     assert minted.token == "ok"
+
+
+def edge_secret_of(request: httpx.Request) -> str | None:
+    return request.headers.get("x-mpass-edge-secret")
+
+
+async def test_only_the_identity_bootstrap_carries_the_edge_secret(minter, zammad):
+    zammad.users[AGENT].tokens.append({"id": 1, "name": "zammad-mcp (auto) 2020-01-01", "expires_at": "2020-01-01"})
+
+    await minter.token_for(identity(AGENT))
+
+    (get,) = zammad.gets()
+    assert edge_secret_of(get) == EDGE_SECRET
+    others = [request for request in zammad.requests if request is not get]
+    assert {request.method for request in others} == {"POST", "DELETE"}
+    assert zammad.signouts() and zammad.deleted == [1]
+    assert [edge_secret_of(request) for request in others] == [None] * len(others)
+
+
+UNUSABLE_SECRETS = ["", "CHANGE_ME_" + "x" * 40, "too-short"]
+
+
+@pytest.mark.parametrize(
+    ("secret", "problem"),
+    [
+        ("", "unset"),
+        ("CHANGE_ME_" + "x" * 40, "a placeholder"),
+        ("x" * 31, "shorter than 32 characters"),
+        ("x" * 31 + "\u00a0", "not printable ASCII"),
+        ("x" * 31 + "\u00e9", "not printable ASCII"),
+        ("x" * 31 + "\x07", "not printable ASCII"),
+        ("x" * 32, None),
+    ],
+)
+def test_edge_secret_problem_matches_zammads_rule(secret, problem):
+    assert edge_secret_problem(secret) == problem
+
+
+@pytest.mark.parametrize("secret", UNUSABLE_SECRETS)
+async def test_an_unusable_edge_secret_is_left_out_and_zammads_refusal_names_it(zammad, store, clock, caplog, secret):
+    caplog.set_level(logging.INFO, logger="zammad_mcp.audit")
+    minter = make_minter(zammad, store, clock, edge_secret=secret)
+
+    with pytest.raises(EdgeSecretMissingError) as raised:
+        await minter.token_for(identity(AGENT))
+
+    (get,) = zammad.gets()
+    assert edge_secret_of(get) is None
+    assert zammad.posts() == []
+    assert "ZAMMAD_EDGE_SECRET" in to_tool_error(raised.value)
+    assert [(line["event"], line["reason"]) for line in audit_lines(caplog)] == [
+        ("token.denied", "edge_secret_missing")
+    ]
+
+
+@pytest.mark.parametrize("secret", UNUSABLE_SECRETS)
+async def test_a_zammad_without_the_edge_check_still_mints_without_a_usable_secret(store, clock, secret):
+    zammad = FakeSsoZammad(edge_secret=None)
+    zammad.add(AGENT, AGENT_PERMISSIONS)
+
+    minted = await make_minter(zammad, store, clock, edge_secret=secret).token_for(identity(AGENT))
+
+    assert minted.token == "minted-1"
+    assert [edge_secret_of(request) for request in zammad.requests] == [None] * len(zammad.requests)
+
+
+async def test_a_missing_edge_secret_keeps_the_cached_token(zammad, store, clock):
+    minted = await make_minter(zammad, store, clock).token_for(identity(AGENT))
+    without_secret = make_minter(zammad, store, clock, edge_secret="")
+
+    assert (await without_secret.token_for(identity(AGENT))).token == minted.token
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    with pytest.raises(EdgeSecretMissingError):
+        await without_secret.token_for(identity(AGENT))
+
+    assert (await cache_for(store).load(identity(AGENT).key)).minted == minted
+
+
+async def test_a_mismatched_edge_secret_is_named_and_keeps_the_cache(zammad, store, clock, caplog):
+    caplog.set_level(logging.INFO, logger="zammad_mcp.audit")
+    minted = await make_minter(zammad, store, clock).token_for(identity(AGENT))
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    wrong = make_minter(zammad, store, clock, edge_secret="w" * 40)
+
+    with pytest.raises(EdgeSecretRejectedError) as raised:
+        await wrong.token_for(identity(AGENT))
+
+    assert "matches Zammad's MPASS_EDGE_SECRET" in to_tool_error(raised.value)
+    assert zammad.posts()[1:] == []
+    assert len(zammad.sessions) == 1
+    assert (await cache_for(store).load(identity(AGENT).key)).minted == minted
+    assert audit_lines(caplog)[-1] == {
+        "event": "token.denied",
+        "identity": identity(AGENT).short_key,
+        "reason": "edge_secret_rejected",
+    }
+
+
+async def test_the_edge_secret_never_reaches_a_log_line(zammad, store, clock, caplog):
+    caplog.set_level(logging.DEBUG)
+    wrong_secret = "w" * 40
+    minter = make_minter(zammad, store, clock)
+
+    await minter.token_for(identity(AGENT))
+    clock.advance(RECHECK_INTERVAL_SECONDS)
+    with pytest.raises(EdgeSecretRejectedError) as raised:
+        await make_minter(zammad, store, clock, edge_secret=wrong_secret).token_for(identity(AGENT))
+
+    assert caplog.records
+    text = caplog.text + str(raised.value) + repr(raised.value)
+    assert EDGE_SECRET not in text
+    assert wrong_secret not in text
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"), [(403, "Authentication required"), (401, "authentication required"), (401, "anything")]
+)
+async def test_an_unauthenticated_answer_to_the_bootstrap_means_the_edge_secret_was_rejected(
+    store, clock, status, detail
+):
+    def unauthenticated(_request):
+        return httpx.Response(status, json={"error": detail})
+
+    with pytest.raises(EdgeSecretRejectedError):
+        await make_minter(httpx.MockTransport(unauthenticated), store, clock).token_for(identity(AGENT))
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"), [(403, "Authentication required"), (401, "authentication required"), (401, "anything")]
+)
+async def test_an_unauthenticated_answer_without_a_usable_secret_means_it_is_missing(store, clock, status, detail):
+    def unauthenticated(_request):
+        return httpx.Response(status, json={"error": detail})
+
+    minter = make_minter(httpx.MockTransport(unauthenticated), store, clock, edge_secret="")
+    with pytest.raises(EdgeSecretMissingError):
+        await minter.token_for(identity(AGENT))
+
+
+async def test_a_plain_bootstrap_403_stays_a_permission_denial(store, clock):
+    def forbidden(_request):
+        return httpx.Response(403, json={"error": "Not authorized"})
+
+    with pytest.raises(PermissionDenied) as raised:
+        await make_minter(httpx.MockTransport(forbidden), store, clock).token_for(identity(AGENT))
+
+    assert type(raised.value) is PermissionDenied

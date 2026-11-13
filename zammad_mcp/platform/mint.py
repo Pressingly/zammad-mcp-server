@@ -4,9 +4,13 @@ Bootstrap (cache miss, re-check, or a rejected token), always on a fresh
 httpx client of its own and the internal Zammad URL:
 
 1. ``GET /user_access_token`` with the SSO email header (plus the upstream
-   access token, for the corporate-ID gate, when there is one). Zammad's SSO
+   access token, for the corporate-ID gate, when there is one) and the edge
+   secret Zammad requires before it trusts those headers. Zammad's SSO
    middleware opens a session for that user and answers with a CSRF token
-   and the user's permissions.
+   and the user's permissions. Without a usable edge secret the header is
+   left out, so a Zammad without the edge check keeps working; one with it
+   answers "Authentication required", which names the missing secret. With
+   a usable secret that answer means the secrets differ.
 2. The ceiling: mintable leaves the role holds (:mod:`.ceiling`). Empty
    fails closed.
 3. ``POST /user_access_token`` with that explicit list and
@@ -63,7 +67,7 @@ from zammad_mcp.client.errors import (
     error_detail,
     error_for_status,
 )
-from zammad_mcp.client.http import USER_AGENT, _cookieless_jar, is_valid_token
+from zammad_mcp.client.http import EDGE_SECRET_HEADER, USER_AGENT, _cookieless_jar, is_valid_token
 from zammad_mcp.platform.ceiling import (
     CeilingError,
     CeilingNarrower,
@@ -95,8 +99,11 @@ SIGNOUT_PATH = "/signout"
 SIGNOUT_TIMEOUT_SECONDS = 5.0
 DEFAULT_NAMESPACE = "local"
 CUSTOMER_TOKEN_ACCESS_DENIED = "user authorization failed."
+UNAUTHENTICATED_DETAIL = "authentication required"
 DEFAULT_EMAIL_HEADER = "X-Auth-Request-Email"
 DEFAULT_ACCESS_TOKEN_HEADER = "X-Auth-Request-Access-Token"
+MIN_EDGE_SECRET_LENGTH = 32
+EDGE_SECRET_PLACEHOLDER_PREFIX = "CHANGE_ME_"
 
 Clock = Callable[[], float]
 
@@ -123,6 +130,37 @@ class EmptyCeilingError(ZammadError):
             "your Zammad role holds none of the permissions this server uses "
             "(ticket.agent, ticket.customer, knowledge_base.reader, knowledge_base.editor)"
         )
+
+
+class EdgeSecretMissingError(ZammadError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Zammad requires an edge secret this server does not have: ZAMMAD_EDGE_SECRET is unset, a placeholder, "
+            f"not printable ASCII or shorter than {MIN_EDGE_SECRET_LENGTH} characters; "
+            "an operator must set it to Zammad's MPASS_EDGE_SECRET"
+        )
+
+
+class EdgeSecretRejectedError(ZammadError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Zammad ignored this server's SSO sign-in headers and treated the request as unauthenticated; "
+            "an operator must check that ZAMMAD_EDGE_SECRET "
+            "matches Zammad's MPASS_EDGE_SECRET and that Zammad's SSO middleware is enabled"
+        )
+
+
+def edge_secret_problem(secret: str) -> str | None:
+    """Why Zammad would not trust ``secret``, matching its own rule; ``None`` when it is usable."""
+    if not secret:
+        return "unset"
+    if secret.startswith(EDGE_SECRET_PLACEHOLDER_PREFIX):
+        return "a placeholder"
+    if not (secret.isascii() and secret.isprintable()):
+        return "not printable ASCII"
+    if len(secret) < MIN_EDGE_SECRET_LENGTH:
+        return f"shorter than {MIN_EDGE_SECRET_LENGTH} characters"
+    return None
 
 
 class MintError(ZammadError):
@@ -324,9 +362,20 @@ def permission_names(raw: Any) -> tuple[str, ...]:
     return tuple(name for name in map(_permission_name, raw) if name is not None)
 
 
-def bootstrap_error(response: httpx.Response) -> ZammadError:
-    """Tell a Customer without token access apart from the SSO middleware's own 403s."""
+def _reached_zammad_unauthenticated(status_code: int, detail: str) -> bool:
+    return status_code == 401 or (status_code == 403 and detail.strip().lower() == UNAUTHENTICATED_DETAIL)
+
+
+def bootstrap_error(response: httpx.Response, *, edge_secret_sent: bool) -> ZammadError:
+    """Tell an untrusted edge and a Customer without token access apart from the SSO middleware's own 403s.
+
+    The bootstrap always carries the email header, so Zammad answering as if
+    the request had no credentials at all means it dropped that header as
+    untrusted: the edge secret is missing, or does not match.
+    """
     detail = error_detail(response)
+    if _reached_zammad_unauthenticated(response.status_code, detail):
+        return EdgeSecretRejectedError() if edge_secret_sent else EdgeSecretMissingError()
     if response.status_code == 403 and detail.strip().lower() == CUSTOMER_TOKEN_ACCESS_DENIED:
         return CustomerTokenAccessError()
     return error_for_status(response.status_code, detail)
@@ -358,10 +407,13 @@ def expired_mcp_token_ids(tokens: Iterable[Mapping[str, Any]], now: float) -> li
 class TokenSession:
     """One user's header session on one fresh httpx client; used for a single bootstrap."""
 
-    def __init__(self, client: httpx.AsyncClient, *, email_header: str, access_token_header: str) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, *, email_header: str, access_token_header: str, edge_secret: str | None
+    ) -> None:
         self._client = client
         self._email_header = email_header
         self._access_token_header = access_token_header
+        self._edge_secret = edge_secret
         self._opened: tuple[str, str] | None = None
 
     async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -371,7 +423,10 @@ class TokenSession:
             raise ZammadTransportError(f"could not reach Zammad to mint a token ({type(exc).__name__})") from exc
 
     async def open(self, identity: Identity) -> SessionGrant:
-        headers = {self._email_header: identity.email}
+        """The only request that carries the identity headers, so the only one that carries the edge secret."""
+        edge_secret_sent = bool(self._edge_secret)
+        edge = {EDGE_SECRET_HEADER: self._edge_secret} if edge_secret_sent else {}
+        headers = {**edge, self._email_header: identity.email}
         if identity.access_token:
             headers[self._access_token_header] = identity.access_token
         response = await self._send("GET", "/user_access_token", headers=headers)
@@ -379,7 +434,7 @@ class TokenSession:
         if cookie:
             self._opened = (cookie, csrf)
         if not response.is_success:
-            raise bootstrap_error(response)
+            raise bootstrap_error(response, edge_secret_sent=edge_secret_sent)
         body = _json_object(response)
         if not cookie or not csrf:
             raise MintError("Zammad did not open a session for the token request; is its SSO middleware enabled?")
@@ -449,12 +504,19 @@ class TokenEndpoint:
         transport: httpx.AsyncBaseTransport | None = None,
         email_header: str = DEFAULT_EMAIL_HEADER,
         access_token_header: str = DEFAULT_ACCESS_TOKEN_HEADER,
+        edge_secret: str = "",
     ) -> None:
         self._base_url = api_base_url.rstrip("/")
         self._timeout = timeout
         self._transport = transport
         self._email_header = email_header
         self._access_token_header = access_token_header
+        self._edge_secret = edge_secret
+
+    @property
+    def usable_edge_secret(self) -> str | None:
+        """Only a secret Zammad would accept is sent; any other is left out rather than sent and rejected."""
+        return self._edge_secret if edge_secret_problem(self._edge_secret) is None else None
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[TokenSession]:
@@ -472,7 +534,10 @@ class TokenEndpoint:
         )
         async with client:
             session = TokenSession(
-                client, email_header=self._email_header, access_token_header=self._access_token_header
+                client,
+                email_header=self._email_header,
+                access_token_header=self._access_token_header,
+                edge_secret=self.usable_edge_secret,
             )
             try:
                 yield session
@@ -584,6 +649,12 @@ class TokenMinter:
     async def _open(self, session: TokenSession, identity: Identity) -> SessionGrant:
         try:
             return await session.open(identity)
+        except EdgeSecretMissingError:
+            _audit("denied", identity, reason="edge_secret_missing")
+            raise
+        except EdgeSecretRejectedError:
+            _audit("denied", identity, reason="edge_secret_rejected")
+            raise
         except ZammadError as error:
             if _is_denial(error):
                 await self._cache.drop(identity.key)

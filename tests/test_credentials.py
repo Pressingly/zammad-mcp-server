@@ -225,7 +225,9 @@ def serve(settings, fake) -> TestClient:
     return TestClient(build_http_app(build_server(settings, transport=fake), settings))
 
 
-@pytest.mark.parametrize("smuggled", ["X-Auth-Request-Email", "X_Auth_Request_Email", "x-auth-request_email"])
+@pytest.mark.parametrize(
+    "smuggled", ["X-Auth-Request-Email", "X_Auth_Request_Email", "x-auth-request_email", "X-Mpass-Edge-Secret"]
+)
 def test_api_key_mount_uses_the_callers_token_end_to_end(api_key_settings, fake, smuggled):
     headers = {"X-Zammad-Token": "user-token", smuggled: "victim@example.com"}
     with serve(api_key_settings, fake) as client:
@@ -233,6 +235,7 @@ def test_api_key_mount_uses_the_callers_token_end_to_end(api_key_settings, fake,
     assert "agent@example.com" in shaped["login"]
     assert {r.headers["authorization"] for r in fake.requests} == {"Token token=user-token"}
     assert all("x-auth-request" not in name.lower() for r in fake.requests for name in r.headers)
+    assert all("x-mpass-edge-secret" not in r.headers for r in fake.requests)
 
 
 def test_plain_mount_ignores_the_header_and_uses_the_static_token(shared_settings, fake):
