@@ -8,6 +8,7 @@ from fastmcp.server.auth import AccessToken
 from fastmcp.server.auth.providers.aws import AWSCognitoProvider
 
 from zammad_mcp.platform.cognito import ACCESS_TOKEN_CLAIM, UPSTREAM_CLAIMS_KEY, ZammadCognitoProvider
+from zammad_mcp.platform.identity import identity_for
 
 ID_TOKEN = jwt.encode(
     {"email": "ada@example.com", "cognito:username": "sid-1", "preferred_username": "sid-1"}, "k" * 32
@@ -129,6 +130,28 @@ async def test_load_access_token_attaches_the_current_identity(provider, validat
     assert loaded.claims["sub"] == "uuid-1"
     assert loaded.claims[UPSTREAM_CLAIMS_KEY]["email"] == "ada@example.com"
     assert loaded.claims[UPSTREAM_CLAIMS_KEY][ACCESS_TOKEN_CLAIM] == "fresh"
+
+
+async def test_the_forwarded_access_token_is_the_one_the_upstream_check_just_refreshed(provider, monkeypatch):
+    """The bootstrap forwards the token FastMCP validated (and refreshed) for this very request, never an older one."""
+    validated = AccessToken(token="t", client_id="c", scopes=["openid"], claims={"sub": "uuid-1"})
+    wire(
+        provider,
+        mapping=SimpleNamespace(upstream_token_id="up-1"),
+        token_set=SimpleNamespace(raw_token_data={"id_token": ID_TOKEN, "access_token": "expired"}),
+    )
+
+    async def refresh_then_validate(self, _token):
+        self._upstream_token_store.values["up-1"] = SimpleNamespace(
+            raw_token_data={"id_token": ID_TOKEN, "access_token": "refreshed"}
+        )
+        return validated
+
+    monkeypatch.setattr(AWSCognitoProvider, "load_access_token", refresh_then_validate)
+
+    loaded = await provider.load_access_token("issued")
+
+    assert identity_for(loaded).access_token == "refreshed"
 
 
 async def test_load_access_token_fails_closed_without_an_id_token(provider, validated):

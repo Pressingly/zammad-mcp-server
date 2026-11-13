@@ -30,6 +30,7 @@ COOKIE_NAME = "_zammad_session_a138cfd0f37"
 TOKEN_PATH = "/api/v1/user_access_token"
 SIGNOUT_PATH = "/api/v1/signout"
 DELETE_PATH = re.compile(r"^/api/v1/user_access_token/(\d+)$")
+EDGE_SECRET = "edge-secret-for-tests-0123456789abcdef"
 
 
 @dataclass
@@ -43,7 +44,9 @@ class FakeUser:
 class FakeSsoZammad(RecordingTransport):
     """Header sessions, CSRF, minting and token auth, with the quirks the spikes recorded."""
 
-    def __init__(self, *, corporate_gate: bool = False) -> None:
+    def __init__(self, *, corporate_gate: bool = False, edge_secret: str | None = EDGE_SECRET) -> None:
+        """``edge_secret=None`` is a Zammad without the edge check, which trusts the identity headers as they come."""
+        self.edge_secret = edge_secret
         self.users: dict[str, FakeUser] = {}
         self.sessions: dict[str, tuple[str, str]] = {}
         self.minted: dict[str, tuple[str, tuple[str, ...]]] = {}
@@ -75,8 +78,12 @@ class FakeSsoZammad(RecordingTransport):
     def posted_body(self, index: int = -1) -> dict[str, Any]:
         return json.loads(self.posts()[index].content)
 
+    def _from_edge(self, request: httpx.Request) -> bool:
+        return self.edge_secret is None or request.headers.get("x-mpass-edge-secret") == self.edge_secret
+
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
-        email = request.headers.get("x-auth-request-email")
+        """Like the patched middleware, identity headers without the edge secret are dropped, not refused."""
+        email = request.headers.get("x-auth-request-email") if self._from_edge(request) else None
         if email is not None:
             denial = self._middleware(request, email.lower())
             if denial is not None:
@@ -91,6 +98,8 @@ class FakeSsoZammad(RecordingTransport):
         match = DELETE_PATH.match(request.url.path)
         if match and request.method == "DELETE":
             return self._with_session(request, lambda owner, req: self._delete(owner, int(match.group(1))))
+        if request.url.path == TOKEN_PATH and "authorization" not in request.headers:
+            return _error(403, "Authentication required")
         return self._token_auth(request)
 
     def _middleware(self, request: httpx.Request, email: str) -> httpx.Response | None:

@@ -2,7 +2,7 @@
 
 Only requests that arrive on the ``/http/api-key`` mount use this provider;
 :func:`api_key_mount` marks them and strips every ``X-Auth-Request-*`` header
-before anything else sees the request. Nothing from the caller other than the
+and ``X-Mpass-Edge-Secret`` before anything else sees the request. Nothing from the caller other than the
 token is ever forwarded to Zammad.
 
 Profiles are memoised for 60 seconds per identity (``sha256(token)[:16]``).
@@ -15,7 +15,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from zammad_mcp.client import ZammadClient
 from zammad_mcp.client.errors import InvalidTokenError, MissingTokenError
-from zammad_mcp.client.http import is_identity_header, is_valid_token
+from zammad_mcp.client.http import is_trust_header, is_valid_token
 from zammad_mcp.credentials.base import CredentialProvider, ProfileMemo, ZammadCredential, fetch_profile, token_identity
 
 API_KEY_MOUNT_PATH = "/http/api-key"
@@ -24,8 +24,8 @@ HEADER_PROFILE_TTL_SECONDS = 60.0
 _SCOPE_MARKER = "zammad_mcp.api_key_mount"
 
 
-def _without_identity_headers(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
-    return [(name, value) for name, value in headers if not is_identity_header(name.decode("latin-1"))]
+def _without_trust_headers(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    return [(name, value) for name, value in headers if not is_trust_header(name.decode("latin-1"))]
 
 
 def api_key_mount(app: ASGIApp) -> ASGIApp:
@@ -33,7 +33,7 @@ def api_key_mount(app: ASGIApp) -> ASGIApp:
 
     async def wrapped(scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
-            scope = {**scope, "headers": _without_identity_headers(list(scope.get("headers", []))), _SCOPE_MARKER: True}
+            scope = {**scope, "headers": _without_trust_headers(list(scope.get("headers", []))), _SCOPE_MARKER: True}
         await app(scope, receive, send)
 
     return wrapped

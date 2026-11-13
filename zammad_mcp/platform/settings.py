@@ -67,6 +67,7 @@ class PlatformSettings:
     client_secret: str = field(default="", repr=False)
     jwt_signing_key: str = field(default="", repr=False)
     storage_url: str = field(default="", repr=False)
+    edge_secret: str = field(default="", repr=False)
     scopes: tuple[str, ...] = DEFAULT_SCOPES
     allowed_redirect_uris: tuple[str, ...] = ()
     allow_any_redirect_uri: bool = False
@@ -134,6 +135,7 @@ class PlatformSettings:
             client_secret=_read(env, "OIDC_CLIENT_SECRET"),
             jwt_signing_key=_read(env, "MCP_JWT_SIGNING_KEY"),
             storage_url=_read(env, "MCP_OAUTH_STORAGE_URL"),
+            edge_secret=_read(env, "ZAMMAD_EDGE_SECRET"),
             scopes=_split(_read(env, "MCP_OIDC_SCOPES"), on_spaces=True) or DEFAULT_SCOPES,
             allowed_redirect_uris=allowed_redirect_uris,
             allow_any_redirect_uri=allow_any_redirect_uri,

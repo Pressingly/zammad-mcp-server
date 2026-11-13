@@ -9,7 +9,8 @@
   ``httpx.Cookies()`` copies the cookies into a fresh jar with the default
   policy and silently drops the refusal.
 - A request hook makes it impossible to send any ``X-Auth-Request-*`` header,
-  which an SSO-fronted Zammad would accept as proof of identity.
+  which an SSO-fronted Zammad would accept as proof of identity, or the
+  ``X-Mpass-Edge-Secret`` that makes Zammad trust one.
 - Retries (see :class:`RetryPolicy`): GET, PUT and DELETE retry on connect
   errors, read and write failures, protocol errors and 502/503/504. POST
   retries only when the request provably never left the process
@@ -50,6 +51,7 @@ from zammad_mcp.client.errors import (
 from zammad_mcp.client.text import is_ascii_digits
 
 IDENTITY_HEADER_PREFIX = "x-auth-request-"
+EDGE_SECRET_HEADER = "X-Mpass-Edge-Secret"
 USER_AGENT = "zammad-mcp-server"
 RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
@@ -110,16 +112,21 @@ def is_identity_header(name: str) -> bool:
     return name.lower().replace("_", "-").startswith(IDENTITY_HEADER_PREFIX)
 
 
+def is_trust_header(name: str) -> bool:
+    """An identity header, or the edge secret that makes Zammad trust one; only the mint bootstrap may send these."""
+    return is_identity_header(name) or name.lower().replace("_", "-") == EDGE_SECRET_HEADER.lower()
+
+
 def is_valid_token(token: str) -> bool:
     return token.isascii() and token.isprintable() and " " not in token
 
 
-def _identity_headers(headers: httpx.Headers) -> list[str]:
-    return [name for name in headers if is_identity_header(name)]
+def _trust_headers(headers: httpx.Headers) -> list[str]:
+    return [name for name in headers if is_trust_header(name)]
 
 
 async def reject_identity_headers(request: httpx.Request) -> None:
-    leaked = _identity_headers(request.headers)
+    leaked = _trust_headers(request.headers)
     if leaked:
         raise IdentityHeaderError(f"refusing to send identity header(s) {', '.join(sorted(leaked))} to Zammad")
 
